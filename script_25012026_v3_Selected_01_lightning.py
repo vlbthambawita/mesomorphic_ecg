@@ -231,6 +231,62 @@ class ECGPatchIMN(nn.Module):
         heatmap = patch_scores.view(x.size(0), 12, T)    # [B,12,T]
         return prob, heatmap
 
+    @torch.no_grad()
+    def explain_with_topk(self, x, topk_leads: int = None, topk_patches: int = None):
+        """
+        returns:
+          prob: [B]
+          heatmap: [B,12,T] signed contributions per lead×segment
+          top_lead_indices: [B, topk_leads] indices of top-k leads
+          top_patch_indices: [B, topk_patches] indices of top-k patches (flattened lead×time)
+        """
+        logit, Wgen, tokens, T = self.forward(x)
+        prob = torch.sigmoid(logit)
+        patch_scores = (Wgen * tokens).sum(dim=-1)       # [B,P]
+        heatmap = patch_scores.view(x.size(0), 12, T)    # [B,12,T]
+        
+        top_lead_indices = None
+        top_patch_indices = None
+        
+        if topk_leads is not None and topk_leads > 0:
+            # Compute per-lead importance (sum of absolute contributions)
+            lead_importance = heatmap.abs().sum(dim=2)  # [B, 12]
+            _, top_lead_indices = torch.topk(lead_importance, k=min(topk_leads, 12), dim=1)  # [B, topk_leads]
+        
+        if topk_patches is not None and topk_patches > 0:
+            # Get top-k patches by absolute contribution
+            patch_abs = patch_scores.abs()  # [B, P]
+            _, top_patch_indices = torch.topk(patch_abs, k=min(topk_patches, patch_scores.size(1)), dim=1)  # [B, topk_patches]
+        
+        return prob, heatmap, top_lead_indices, top_patch_indices
+
+    def forward_with_dropout(self, x, verbose: bool = None):
+        """
+        Forward pass with dropout enabled (for Monte Carlo dropout).
+        """
+        if verbose is None:
+            verbose = self.verbose
+        
+        # Enable dropout layers
+        self.train()  # This enables dropout
+        
+        patches, T = patchify_ecg_overlap(x, self.window, self.stride)  # [B,P,W]
+        B, P, W = patches.shape
+        
+        patches_ = patches.view(B * P, 1, W)
+        tok = self.patch_embed(patches_)                # [B*P,D]
+        tokens = tok.view(B, P, self.token_dim)         # [B,P,D]
+        
+        g = self.g_proj(tokens.mean(dim=1))             # [B,D]
+        out = self.hyper(g)                             # [B, P*D+1]
+        
+        Wgen = out[:, :-1].view(B, P, self.token_dim)   # [B,P,D]
+        b = out[:, -1]                                  # [B]
+        
+        logit = (Wgen * tokens).sum(dim=(1, 2)) + b
+        
+        return logit, Wgen, tokens, T
+
 
 # -----------------------
 # Metrics
@@ -450,6 +506,54 @@ class ECGPatchIMNLightning(pl.LightningModule):
     def explain(self, x):
         return self.model.explain(x)
 
+    @torch.no_grad()
+    def explain_with_topk(self, x, topk_leads: int = None, topk_patches: int = None):
+        return self.model.explain_with_topk(x, topk_leads, topk_patches)
+
+    @torch.no_grad()
+    def monte_carlo_dropout_inference(self, x, n_samples: int = 50):
+        """
+        Perform Monte Carlo dropout inference.
+        Returns:
+          mean_prob: [B] mean probability across samples
+          mean_heatmap: [B,12,T] mean heatmap across samples
+          std_heatmap: [B,12,T] std of heatmap across samples
+          mean_logit: [B] mean logit across samples
+          std_logit: [B] std of logit across samples
+        """
+        B = x.size(0)
+        T = self.model.T
+        
+        # Collect samples
+        logits = []
+        heatmaps = []
+        
+        for _ in range(n_samples):
+            # Temporarily enable training mode for dropout, but keep no_grad
+            self.model.train()
+            logit, Wgen, tokens, _ = self.model.forward_with_dropout(x)
+            self.model.eval()
+            
+            prob = torch.sigmoid(logit)
+            patch_scores = (Wgen * tokens).sum(dim=-1)  # [B,P]
+            heatmap = patch_scores.view(B, 12, T)       # [B,12,T]
+            
+            logits.append(logit)
+            heatmaps.append(heatmap)
+        
+        # Stack and compute statistics
+        logits_stack = torch.stack(logits, dim=0)  # [n_samples, B]
+        heatmaps_stack = torch.stack(heatmaps, dim=0)  # [n_samples, B, 12, T]
+        
+        mean_logit = logits_stack.mean(dim=0)  # [B]
+        std_logit = logits_stack.std(dim=0)    # [B]
+        mean_prob = torch.sigmoid(mean_logit)  # [B]
+        
+        mean_heatmap = heatmaps_stack.mean(dim=0)  # [B, 12, T]
+        std_heatmap = heatmaps_stack.std(dim=0)    # [B, 12, T]
+        
+        return mean_prob, mean_heatmap, std_heatmap, mean_logit, std_logit
+
 
 # -----------------------
 # Checkpointing / Logging
@@ -582,6 +686,269 @@ def visualize_pos_neg_to_pdf(model, dataset, device, pdf_path: str, sampling_rat
 
 
 # -----------------------
+# Visualization: Top-k leads and patches
+# -----------------------
+@torch.no_grad()
+def visualize_topk_leads_patches_to_pdf(model, dataset, device, pdf_path: str, sampling_rate: int,
+                                       window: int, stride: int,
+                                       n_pos: int, n_neg: int,
+                                       topk_leads: int = 3,
+                                       topk_patches: int = 10,
+                                       random_pick: bool = False, seed: int = 123,
+                                       lead_names=None):
+    """
+    Visualizes samples with top-k leads and patches highlighted.
+    """
+    model.eval()
+    if lead_names is None:
+        lead_names = ["I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"]
+
+    os.makedirs(os.path.dirname(pdf_path) or ".", exist_ok=True)
+
+    # Collect indices by label
+    pos_idx = []
+    neg_idx = []
+    for i in range(len(dataset)):
+        _, y = dataset[i]
+        yv = int(float(y))
+        if yv == 1:
+            pos_idx.append(i)
+        else:
+            neg_idx.append(i)
+
+    if random_pick:
+        rng = np.random.default_rng(seed)
+        rng.shuffle(pos_idx)
+        rng.shuffle(neg_idx)
+
+    sel_pos = pos_idx[:n_pos]
+    sel_neg = neg_idx[:n_neg]
+
+    selected = [("MI", i) for i in sel_pos] + [("NORM", i) for i in sel_neg]
+
+    with PdfPages(pdf_path) as pdf:
+        for tag, idx in selected:
+            x, y = dataset[idx]
+            x_b = x.unsqueeze(0).to(device)  # [1,12,L]
+
+            prob, heatmap, top_lead_indices, top_patch_indices = model.explain_with_topk(
+                x_b, topk_leads=topk_leads, topk_patches=topk_patches
+            )
+            prob = float(prob.item())
+            hm = heatmap.squeeze(0).detach().cpu().numpy()  # [12,T]
+            x_np = x.detach().cpu().numpy()                 # [12,L]
+            
+            # Get top-k indices
+            top_leads = top_lead_indices.squeeze(0).cpu().numpy() if top_lead_indices is not None else np.array([])
+            top_patches = top_patch_indices.squeeze(0).cpu().numpy() if top_patch_indices is not None else np.array([])
+            
+            # Convert patch indices to (lead, time) coordinates
+            T = hm.shape[1]
+            top_patch_coords = []
+            for p_idx in top_patches:
+                lead_idx = p_idx // T
+                time_idx = p_idx % T
+                top_patch_coords.append((lead_idx, time_idx))
+
+            denom = np.max(np.abs(hm)) + 1e-6
+            hm_disp = hm / denom
+
+            L = x_np.shape[1]
+
+            fig = plt.figure(figsize=(11.7, 16.5))
+            gs = fig.add_gridspec(14, 1, height_ratios=[2] + [1]*12 + [0.5])
+
+            # Heatmap with top-k leads highlighted
+            ax0 = fig.add_subplot(gs[0, 0])
+            im = ax0.imshow(hm_disp, aspect="auto", vmin=-1, vmax=1, cmap="bwr")
+            
+            # Highlight top-k leads
+            for lidx in top_leads:
+                ax0.axhline(y=lidx-0.5, color='yellow', linewidth=3, alpha=0.7)
+                ax0.axhline(y=lidx+0.5, color='yellow', linewidth=3, alpha=0.7)
+            
+            ax0.set_yticks(range(12))
+            ax0.set_yticklabels(lead_names)
+            ax0.set_xlabel(f"Segments (window={window}, stride={stride}, fs={sampling_rate}Hz)")
+            title = f"{tag} sample | true={int(y.item())} | P(MI)={prob:.3f} | idx={idx}"
+            if len(top_leads) > 0:
+                top_lead_names = [lead_names[i] for i in top_leads]
+                title += f"\nTop-{len(top_leads)} leads: {', '.join(top_lead_names)}"
+            ax0.set_title(title)
+            fig.colorbar(im, ax=ax0, fraction=0.02, pad=0.01)
+
+            # Plot each lead
+            for lead in range(12):
+                ax = fig.add_subplot(gs[lead + 1, 0])
+                ax.plot(x_np[lead], linewidth=0.8)
+                ax.set_xlim(0, L - 1)
+                ax.set_ylabel(lead_names[lead], rotation=0, labelpad=20, va="center")
+
+                # Highlight if this is a top-k lead
+                is_top_lead = lead in top_leads
+                if is_top_lead:
+                    ax.axhspan(ax.get_ylim()[0], ax.get_ylim()[1], alpha=0.2, color='yellow', zorder=0)
+
+                contrib = hm_disp[lead]  # [T]
+                for t in range(T):
+                    a = float(contrib[t])
+                    alpha = min(0.30, abs(a) * 0.30)
+                    if alpha > 0:
+                        color = "red" if a > 0 else "blue"
+                        start = t * stride
+                        end = min(start + window, L)
+                        
+                        # Highlight top-k patches with thicker border
+                        is_top_patch = (lead, t) in top_patch_coords
+                        if is_top_patch:
+                            ax.axvspan(start, end, alpha=alpha, color=color, linewidth=2, edgecolor='lime', zorder=1)
+                        else:
+                            ax.axvspan(start, end, alpha=alpha, color=color, linewidth=0)
+
+                ax.set_xticks([])
+
+            axf = fig.add_subplot(gs[13, 0])
+            axf.axis("off")
+            info_text = "Red=pushes toward MI, Blue=pushes toward NORM (signed contributions; normalized per record).\n"
+            info_text += f"Yellow highlight: Top-{topk_leads} leads | Lime border: Top-{topk_patches} patches"
+            axf.text(0, 0.5, info_text, fontsize=10)
+
+            fig.tight_layout()
+            pdf.savefig(fig)
+            plt.close(fig)
+
+
+# -----------------------
+# Visualization: Monte Carlo Dropout Uncertainty
+# -----------------------
+@torch.no_grad()
+def visualize_uncertainty_to_pdf(model, dataset, device, pdf_path: str, sampling_rate: int,
+                                 window: int, stride: int,
+                                 n_pos: int, n_neg: int,
+                                 n_mc_samples: int = 50,
+                                 random_pick: bool = False, seed: int = 123,
+                                 lead_names=None):
+    """
+    Visualizes uncertainty from Monte Carlo dropout sampling.
+    """
+    model.eval()
+    if lead_names is None:
+        lead_names = ["I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"]
+
+    os.makedirs(os.path.dirname(pdf_path) or ".", exist_ok=True)
+
+    # Collect indices by label
+    pos_idx = []
+    neg_idx = []
+    for i in range(len(dataset)):
+        _, y = dataset[i]
+        yv = int(float(y))
+        if yv == 1:
+            pos_idx.append(i)
+        else:
+            neg_idx.append(i)
+
+    if random_pick:
+        rng = np.random.default_rng(seed)
+        rng.shuffle(pos_idx)
+        rng.shuffle(neg_idx)
+
+    sel_pos = pos_idx[:n_pos]
+    sel_neg = neg_idx[:n_neg]
+
+    selected = [("MI", i) for i in sel_pos] + [("NORM", i) for i in sel_neg]
+
+    with PdfPages(pdf_path) as pdf:
+        for tag, idx in selected:
+            x, y = dataset[idx]
+            x_b = x.unsqueeze(0).to(device)  # [1,12,L]
+
+            # Monte Carlo dropout inference
+            mean_prob, mean_heatmap, std_heatmap, mean_logit, std_logit = model.monte_carlo_dropout_inference(
+                x_b, n_samples=n_mc_samples
+            )
+            
+            mean_prob_val = float(mean_prob.item())
+            std_logit_val = float(std_logit.item())
+            mean_hm = mean_heatmap.squeeze(0).detach().cpu().numpy()  # [12,T]
+            std_hm = std_heatmap.squeeze(0).detach().cpu().numpy()    # [12,T]
+            x_np = x.detach().cpu().numpy()                           # [12,L]
+
+            denom_mean = np.max(np.abs(mean_hm)) + 1e-6
+            mean_hm_disp = mean_hm / denom_mean
+            
+            # Normalize std by max std value
+            denom_std = np.max(std_hm) + 1e-6
+            std_hm_disp = std_hm / denom_std
+
+            L = x_np.shape[1]
+            T = mean_hm.shape[1]
+
+            fig = plt.figure(figsize=(11.7, 20))
+            gs = fig.add_gridspec(15, 1, height_ratios=[2, 2] + [1]*12 + [0.5])
+
+            # Mean heatmap
+            ax0 = fig.add_subplot(gs[0, 0])
+            im0 = ax0.imshow(mean_hm_disp, aspect="auto", vmin=-1, vmax=1, cmap="bwr")
+            ax0.set_yticks(range(12))
+            ax0.set_yticklabels(lead_names)
+            ax0.set_xlabel(f"Segments (window={window}, stride={stride}, fs={sampling_rate}Hz)")
+            ax0.set_title(f"{tag} sample | true={int(y.item())} | P(MI)={mean_prob_val:.3f}±{std_logit_val:.3f} | idx={idx} | Mean Contributions")
+            fig.colorbar(im0, ax=ax0, fraction=0.02, pad=0.01)
+
+            # Uncertainty heatmap (std)
+            ax1 = fig.add_subplot(gs[1, 0])
+            im1 = ax1.imshow(std_hm_disp, aspect="auto", vmin=0, vmax=1, cmap="hot")
+            ax1.set_yticks(range(12))
+            ax1.set_yticklabels(lead_names)
+            ax1.set_xlabel(f"Segments (window={window}, stride={stride}, fs={sampling_rate}Hz)")
+            ax1.set_title(f"Uncertainty (Std) across {n_mc_samples} MC samples")
+            fig.colorbar(im1, ax=ax1, fraction=0.02, pad=0.01)
+
+            # Plot each lead with uncertainty shading
+            for lead in range(12):
+                ax = fig.add_subplot(gs[lead + 2, 0])
+                ax.plot(x_np[lead], linewidth=0.8, color='black', label='Signal')
+                ax.set_xlim(0, L - 1)
+                ax.set_ylabel(lead_names[lead], rotation=0, labelpad=20, va="center")
+
+                # Mean contribution shading
+                mean_contrib = mean_hm_disp[lead]  # [T]
+                std_contrib = std_hm_disp[lead]    # [T]
+                
+                for t in range(T):
+                    a_mean = float(mean_contrib[t])
+                    a_std = float(std_contrib[t])
+                    
+                    alpha_mean = min(0.30, abs(a_mean) * 0.30)
+                    alpha_std = min(0.15, a_std * 0.15)  # Uncertainty shading
+                    
+                    start = t * stride
+                    end = min(start + window, L)
+                    
+                    if alpha_mean > 0:
+                        color = "red" if a_mean > 0 else "blue"
+                        ax.axvspan(start, end, alpha=alpha_mean, color=color, linewidth=0, label='Mean contribution' if t == 0 else '')
+                    
+                    # Overlay uncertainty (darker = more uncertain)
+                    if alpha_std > 0:
+                        ax.axvspan(start, end, alpha=alpha_std, color='gray', linewidth=0, label='Uncertainty' if t == 0 else '')
+
+                ax.set_xticks([])
+
+            axf = fig.add_subplot(gs[14, 0])
+            axf.axis("off")
+            info_text = f"Mean contributions: Red=pushes toward MI, Blue=pushes toward NORM.\n"
+            info_text += f"Gray overlay: Uncertainty (darker = more uncertain).\n"
+            info_text += f"MC Dropout: {n_mc_samples} samples | P(MI)={mean_prob_val:.3f}±{std_logit_val:.3f}"
+            axf.text(0, 0.5, info_text, fontsize=10)
+
+            fig.tight_layout()
+            pdf.savefig(fig)
+            plt.close(fig)
+
+
+# -----------------------
 # Main
 # -----------------------
 def main():
@@ -640,6 +1007,18 @@ def main():
     parser.add_argument("--n_neg_viz", type=int, default=25, help="Number of NORM (negative) test samples to visualize")
     parser.add_argument("--viz_random", action="store_true", help="Randomly sample positives/negatives instead of first N/M")
     parser.add_argument("--viz_seed", type=int, default=123, help="Seed for viz sampling when --viz_random is set")
+    
+    # Top-k visualization
+    parser.add_argument("--viz_topk", action="store_true", help="Enable top-k leads/patches visualization")
+    parser.add_argument("--topk_leads", type=int, default=3, help="Number of top-k leads to highlight")
+    parser.add_argument("--topk_patches", type=int, default=10, help="Number of top-k patches to highlight")
+    parser.add_argument("--viz_topk_pdf", type=str, default="viz_topk_test.pdf", help="Output PDF filename for top-k visualization")
+    
+    # Monte Carlo Dropout visualization
+    parser.add_argument("--viz_mc_dropout", action="store_true", help="Enable Monte Carlo dropout uncertainty visualization")
+    parser.add_argument("--mc_samples", type=int, default=50, help="Number of Monte Carlo samples for uncertainty estimation")
+    parser.add_argument("--viz_uncertainty_pdf", type=str, default="viz_uncertainty_test.pdf", help="Output PDF filename for uncertainty visualization")
+    
     parser.add_argument("--verbose", action="store_true", help="Verbose mode")
 
     # Checkpoints
@@ -861,6 +1240,54 @@ def main():
         seed=args.viz_seed
     )
     print("Done.")
+    
+    # Top-k leads and patches visualization
+    if args.viz_topk:
+        topk_pdf_path = args.viz_topk_pdf
+        if not os.path.isabs(topk_pdf_path):
+            topk_pdf_path = os.path.join(run_dir, topk_pdf_path)
+        
+        print(f"\n📊 Saving top-k leads/patches visualizations to: {topk_pdf_path}")
+        visualize_topk_leads_patches_to_pdf(
+            model=model,
+            dataset=test_ds,
+            device=device,
+            pdf_path=topk_pdf_path,
+            sampling_rate=args.sampling_rate,
+            window=window,
+            stride=stride,
+            n_pos=args.n_pos_viz,
+            n_neg=args.n_neg_viz,
+            topk_leads=args.topk_leads,
+            topk_patches=args.topk_patches,
+            random_pick=args.viz_random,
+            seed=args.viz_seed
+        )
+        print("Top-k visualization done.")
+    
+    # Monte Carlo Dropout uncertainty visualization
+    if args.viz_mc_dropout:
+        uncertainty_pdf_path = args.viz_uncertainty_pdf
+        if not os.path.isabs(uncertainty_pdf_path):
+            uncertainty_pdf_path = os.path.join(run_dir, uncertainty_pdf_path)
+        
+        print(f"\n📊 Saving Monte Carlo dropout uncertainty visualizations to: {uncertainty_pdf_path}")
+        print(f"   Running {args.mc_samples} MC samples per test sample...")
+        visualize_uncertainty_to_pdf(
+            model=model,
+            dataset=test_ds,
+            device=device,
+            pdf_path=uncertainty_pdf_path,
+            sampling_rate=args.sampling_rate,
+            window=window,
+            stride=stride,
+            n_pos=args.n_pos_viz,
+            n_neg=args.n_neg_viz,
+            n_mc_samples=args.mc_samples,
+            random_pick=args.viz_random,
+            seed=args.viz_seed
+        )
+        print("Uncertainty visualization done.")
 
     # Finish WandB run
     wandb.finish()
