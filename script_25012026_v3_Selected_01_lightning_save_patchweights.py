@@ -1,9 +1,8 @@
 """
-ECG Patch IMN (Lightning) — with optional save of final Wgen and tokens.
+ECG Patch IMN (Lightning) — hypernetwork outputs scalar weights per patch.
 
-Use --save_wgen_tokens to save Wgen [N,P,D] and tokens [N,P,D] plus labels, logits, probs.
-Formats: --save_wgen_tokens_format npz|pt|h5|all. Splits: --save_wgen_tokens_split test|val|both.
-See "BEST OPTIONS FOR SAVING" in code for when to use each format.
+Use --save_patch_weights to save patch_weights [N,P] and tokens [N,P,D] plus labels, logits, probs.
+Formats: --save_patch_weights_format npz|pt|h5|all. Splits: --save_patch_weights_split test|val|both.
 """
 import argparse
 import ast
@@ -122,16 +121,20 @@ def patchify_ecg_overlap(x: torch.Tensor, window: int, stride: int):
 
 # -----------------------
 # Model: Patch-wise IMN (binary) with overlap support
+# Hypernetwork outputs scalar weights per patch
 # -----------------------
-class ECGPatchIMN(nn.Module):
+class ECGPatchIMN_PatchWeights(nn.Module):
     """
     - Patch ECG into lead×time windows (overlapping allowed)
     - Patch embedder (shared) -> token
     - Pool tokens -> g
-    - Hypernet(g) -> instance-specific linear weights over tokens
-    - logit = sum_{p,d} W_{p,d} * token_{p,d} + b
+    - Hypernet(g) -> instance-specific scalar weights over patches
+    - Per-patch scalar score from token
+    - logit = sum_p alpha_p * s_p + b, where alpha are hypernet weights
     """
-    def __init__(self, signal_len: int, window: int, stride: int, token_dim: int = 64, hyper_hidden: int = 256, dropout: float = 0.1, verbose: bool = False):
+    def __init__(self, signal_len: int, window: int, stride: int,
+                 token_dim: int = 64, hyper_hidden: int = 256,
+                 dropout: float = 0.1, verbose: bool = False):
         super().__init__()
         self.signal_len = signal_len
         self.window = window
@@ -159,7 +162,12 @@ class ECGPatchIMN(nn.Module):
             nn.GELU(),
         )
 
-        # Binary => output (P*D + 1)
+        # Map token to scalar patch score
+        self.token_to_scalar = nn.Sequential(
+            nn.Linear(token_dim, 1),
+        )
+
+        # Binary => output (P + 1): P patch weights + bias
         self.hyper = nn.Sequential(
             nn.Linear(token_dim, hyper_hidden),
             nn.GELU(),
@@ -167,7 +175,7 @@ class ECGPatchIMN(nn.Module):
             nn.Linear(hyper_hidden, hyper_hidden),
             nn.GELU(),
             nn.Dropout(dropout),
-            nn.Linear(hyper_hidden, self.P * token_dim + 1),
+            nn.Linear(hyper_hidden, self.P + 1),
         )
 
     def forward(self, x, verbose: bool = None):
@@ -175,60 +183,39 @@ class ECGPatchIMN(nn.Module):
         x: [B,12,L]
         returns:
           logit: [B]
-          Wgen: [B,P,D]
+          patch_weights: [B,P] (pre-softmax)
           tokens: [B,P,D]
           T: number of time segments
         """
         if verbose is None:
             verbose = self.verbose
-        
-        if verbose:
-            print(f"[Forward] Input x shape: {x.shape}")
-        
+
         patches, T = patchify_ecg_overlap(x, self.window, self.stride)  # [B,P,W]
         B, P, W = patches.shape
         assert T == self.T, f"T mismatch: got {T}, expected {self.T}"
         assert P == self.P, f"P mismatch: got {P}, expected {self.P}"
         assert W == self.window
-        
-        if verbose:
-            print(f"[Forward] After patchify: patches shape: {patches.shape}, T: {T}")
 
         patches_ = patches.view(B * P, 1, W)
-        if verbose:
-            print(f"[Forward] After reshape: patches_ shape: {patches_.shape}")
-        
         tok = self.patch_embed(patches_)                # [B*P,D]
-        if verbose:
-            print(f"[Forward] After patch_embed: tok shape: {tok.shape}")
-        
         tokens = tok.view(B, P, self.token_dim)         # [B,P,D]
-        if verbose:
-            print(f"[Forward] After reshape to tokens: tokens shape: {tokens.shape}")
-            print(f"[Forward] Tokens mean shape: {tokens.mean(dim=1).shape}")
-            
 
+        # Global summary token
         g = self.g_proj(tokens.mean(dim=1))             # [B,D]
-        if verbose:
-            print(f"[Forward] After g_proj: g shape: {g.shape}")
-        
-        out = self.hyper(g)                             # [B, P*D+1]
-        if verbose:
-            print(f"[Forward] After hyper: out shape: {out.shape}")
-        
-        Wgen = out[:, :-1].view(B, P, self.token_dim)   # [B,P,D]
+        out = self.hyper(g)                             # [B, P+1]
+
+        patch_weights = out[:, :-1]                     # [B,P]
         b = out[:, -1]                                  # [B]
-        if verbose:
-            print(f"[Forward] After splitting: Wgen shape: {Wgen.shape}, b shape: {b.shape}")
-            print(f"[Forward] Wgen*tokens shape: {(Wgen*tokens).shape}")
 
-        logit = (Wgen * tokens).sum(dim=(1, 2)) + b
-        if verbose:
-            print(f"[Forward] Final output: logit shape: {logit.shape}")
+        # Normalize to attention-like weights
+        alpha = torch.softmax(patch_weights, dim=1)     # [B,P]
 
-        if verbose:
-            print(f"[Forward] Final output: logit shape: {logit.shape}, Wgen shape: {Wgen.shape}, tokens shape: {tokens.shape}, T: {T}")
-        return logit, Wgen, tokens, T
+        # Per-patch scalar score from tokens
+        patch_scores = self.token_to_scalar(tokens).squeeze(-1)  # [B,P]
+
+        logit = (alpha * patch_scores).sum(dim=1) + b   # [B]
+
+        return logit, patch_weights, tokens, T
 
     @torch.no_grad()
     def explain(self, x):
@@ -237,10 +224,14 @@ class ECGPatchIMN(nn.Module):
           prob: [B]
           heatmap: [B,12,T] signed contributions per lead×segment
         """
-        logit, Wgen, tokens, T = self.forward(x)
+        logit, patch_weights, tokens, T = self.forward(x)
         prob = torch.sigmoid(logit)
-        patch_scores = (Wgen * tokens).sum(dim=-1)       # [B,P]
-        heatmap = patch_scores.view(x.size(0), 12, T)    # [B,12,T]
+
+        alpha = torch.softmax(patch_weights, dim=1)           # [B,P]
+        patch_scores = self.token_to_scalar(tokens).squeeze(-1)  # [B,P]
+        contributions = alpha * patch_scores                  # [B,P]
+
+        heatmap = contributions.view(x.size(0), 12, T)        # [B,12,T]
         return prob, heatmap
 
     @torch.no_grad()
@@ -252,24 +243,27 @@ class ECGPatchIMN(nn.Module):
           top_lead_indices: [B, topk_leads] indices of top-k leads
           top_patch_indices: [B, topk_patches] indices of top-k patches (flattened lead×time)
         """
-        logit, Wgen, tokens, T = self.forward(x)
+        logit, patch_weights, tokens, T = self.forward(x)
         prob = torch.sigmoid(logit)
-        patch_scores = (Wgen * tokens).sum(dim=-1)       # [B,P]
-        heatmap = patch_scores.view(x.size(0), 12, T)    # [B,12,T]
-        
+
+        alpha = torch.softmax(patch_weights, dim=1)           # [B,P]
+        patch_scores = self.token_to_scalar(tokens).squeeze(-1)  # [B,P]
+        contributions = alpha * patch_scores                  # [B,P]
+
+        heatmap = contributions.view(x.size(0), 12, T)        # [B,12,T]
+
         top_lead_indices = None
         top_patch_indices = None
-        
+
         if topk_leads is not None and topk_leads > 0:
             # Compute per-lead importance (sum of absolute contributions)
             lead_importance = heatmap.abs().sum(dim=2)  # [B, 12]
             _, top_lead_indices = torch.topk(lead_importance, k=min(topk_leads, 12), dim=1)  # [B, topk_leads]
-        
+
         if topk_patches is not None and topk_patches > 0:
-            # Get top-k patches by absolute contribution
-            patch_abs = patch_scores.abs()  # [B, P]
-            _, top_patch_indices = torch.topk(patch_abs, k=min(topk_patches, patch_scores.size(1)), dim=1)  # [B, topk_patches]
-        
+            patch_abs = contributions.abs()  # [B, P]
+            _, top_patch_indices = torch.topk(patch_abs, k=min(topk_patches, contributions.size(1)), dim=1)  # [B, topk_patches]
+
         return prob, heatmap, top_lead_indices, top_patch_indices
 
     def forward_with_dropout(self, x, verbose: bool = None):
@@ -278,27 +272,29 @@ class ECGPatchIMN(nn.Module):
         """
         if verbose is None:
             verbose = self.verbose
-        
+
         # Enable dropout layers
         self.train()  # This enables dropout
-        
+
         patches, T = patchify_ecg_overlap(x, self.window, self.stride)  # [B,P,W]
         B, P, W = patches.shape
-        
+
         patches_ = patches.view(B * P, 1, W)
         tok = self.patch_embed(patches_)                # [B*P,D]
         tokens = tok.view(B, P, self.token_dim)         # [B,P,D]
-        
+
         g = self.g_proj(tokens.mean(dim=1))             # [B,D]
-        out = self.hyper(g)                             # [B, P*D+1]
-        
-        Wgen = out[:, :-1].view(B, P, self.token_dim)   # [B,P,D]
+        out = self.hyper(g)                             # [B, P+1]
+
+        patch_weights = out[:, :-1]                     # [B,P]
         b = out[:, -1]                                  # [B]
-        
-        logit = (Wgen * tokens).sum(dim=(1, 2)) + b
 
+        alpha = torch.softmax(patch_weights, dim=1)     # [B,P]
+        patch_scores = self.token_to_scalar(tokens).squeeze(-1)  # [B,P]
 
-        return logit, Wgen, tokens, T
+        logit = (alpha * patch_scores).sum(dim=1) + b   # [B]
+
+        return logit, patch_weights, tokens, T
 
 
 # -----------------------
@@ -346,8 +342,8 @@ class ECGPatchIMNLightning(pl.LightningModule):
     ):
         super().__init__()
         self.save_hyperparameters()
-        
-        self.model = ECGPatchIMN(
+
+        self.model = ECGPatchIMN_PatchWeights(
             signal_len=signal_len,
             window=window,
             stride=stride,
@@ -356,21 +352,21 @@ class ECGPatchIMNLightning(pl.LightningModule):
             dropout=dropout,
             verbose=verbose
         )
-        
+
         self.lr = lr
         self.weight_decay = weight_decay
         self.l1_lambda = l1_lambda
         self.pos_weight = pos_weight
         self.scheduler_type = scheduler_type
         self.scheduler_params = scheduler_params or {}
-        
+
         # For tracking metrics
         self.pos_w = None
-        
+
         # For storing outputs for epoch-end calculations
         self.validation_outputs = []
         self.test_outputs = []
-        
+
         # Store verbose flag
         self.verbose = verbose
 
@@ -381,64 +377,64 @@ class ECGPatchIMNLightning(pl.LightningModule):
 
     def training_step(self, batch, batch_idx):
         x, y = batch
-        logit, Wgen, tokens, T = self.model(x)
-        
+        logit, patch_weights, tokens, T = self.model(x)
+
         if self.pos_w is None:
             self.pos_w = torch.tensor([self.pos_weight], device=self.device)
-        
+
         bce = F.binary_cross_entropy_with_logits(logit, y, pos_weight=self.pos_w)
-        l1 = Wgen.abs().mean()
+        l1 = patch_weights.abs().mean()
         loss = bce + self.l1_lambda * l1
-        
+
         with torch.no_grad():
             pred = (torch.sigmoid(logit) > 0.5).float()
             acc = (pred == y).float().mean()
-        
+
         self.log("train_loss", loss, on_step=True, on_epoch=True, prog_bar=True)
         self.log("train_acc", acc, on_step=True, on_epoch=True, prog_bar=True)
         self.log("train_bce", bce, on_step=False, on_epoch=True)
         self.log("train_l1", l1, on_step=False, on_epoch=True)
-        
+
         return loss
 
     def validation_step(self, batch, batch_idx):
         x, y = batch
-        logit, Wgen, tokens, T = self.model(x)
-        
+        logit, patch_weights, tokens, T = self.model(x)
+
         bce = F.binary_cross_entropy_with_logits(logit, y)
-        l1 = Wgen.abs().mean()
+        l1 = patch_weights.abs().mean()
         loss = bce + self.l1_lambda * l1
-        
+
         prob = torch.sigmoid(logit)
         pred = (prob > 0.5).float()
         acc = (pred == y).float().mean()
-        
+
         self.log("val_loss", loss, on_step=False, on_epoch=True, prog_bar=True)
         self.log("val_acc", acc, on_step=False, on_epoch=True, prog_bar=True)
         self.log("val_bce", bce, on_step=False, on_epoch=True)
         self.log("val_l1", l1, on_step=False, on_epoch=True)
-        
+
         output = {"y": y, "prob": prob, "loss": loss, "acc": acc}
         self.validation_outputs.append(output)
         return output
 
     def test_step(self, batch, batch_idx):
         x, y = batch
-        logit, Wgen, tokens, T = self.model(x)
-        
+        logit, patch_weights, tokens, T = self.model(x)
+
         bce = F.binary_cross_entropy_with_logits(logit, y)
-        l1 = Wgen.abs().mean()
+        l1 = patch_weights.abs().mean()
         loss = bce + self.l1_lambda * l1
-        
+
         prob = torch.sigmoid(logit)
         pred = (prob > 0.5).float()
         acc = (pred == y).float().mean()
-        
+
         self.log("test_loss", loss, on_step=False, on_epoch=True)
         self.log("test_acc", acc, on_step=False, on_epoch=True)
         self.log("test_bce", bce, on_step=False, on_epoch=True)
         self.log("test_l1", l1, on_step=False, on_epoch=True)
-        
+
         output = {"y": y, "prob": prob, "loss": loss, "acc": acc}
         self.test_outputs.append(output)
         return output
@@ -469,7 +465,7 @@ class ECGPatchIMNLightning(pl.LightningModule):
             lr=self.lr,
             weight_decay=self.weight_decay
         )
-        
+
         if self.scheduler_type == "cosine":
             scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
                 optimizer,
@@ -500,7 +496,7 @@ class ECGPatchIMNLightning(pl.LightningModule):
             )
         else:
             return optimizer
-        
+
         if self.scheduler_type == "reduce_on_plateau":
             return {
                 "optimizer": optimizer,
@@ -536,92 +532,60 @@ class ECGPatchIMNLightning(pl.LightningModule):
         """
         B = x.size(0)
         T = self.model.T
-        
+
         # Collect samples
         logits = []
         heatmaps = []
-        
+
         for _ in range(n_samples):
             # Temporarily enable training mode for dropout, but keep no_grad
             self.model.train()
-            logit, Wgen, tokens, _ = self.model.forward_with_dropout(x)
+            logit, patch_weights, tokens, _ = self.model.forward_with_dropout(x)
             self.model.eval()
-            
+
             prob = torch.sigmoid(logit)
-            patch_scores = (Wgen * tokens).sum(dim=-1)  # [B,P]
-            heatmap = patch_scores.view(B, 12, T)       # [B,12,T]
-            
+
+            alpha = torch.softmax(patch_weights, dim=1)           # [B,P]
+            patch_scores = self.model.token_to_scalar(tokens).squeeze(-1)  # [B,P]
+            contributions = alpha * patch_scores                  # [B,P]
+            heatmap = contributions.view(B, 12, T)                # [B,12,T]
+
             logits.append(logit)
             heatmaps.append(heatmap)
-        
+
         # Stack and compute statistics
         logits_stack = torch.stack(logits, dim=0)  # [n_samples, B]
         heatmaps_stack = torch.stack(heatmaps, dim=0)  # [n_samples, B, 12, T]
-        
+
         mean_logit = logits_stack.mean(dim=0)  # [B]
         std_logit = logits_stack.std(dim=0)    # [B]
         mean_prob = torch.sigmoid(mean_logit)  # [B]
-        
+
         mean_heatmap = heatmaps_stack.mean(dim=0)  # [B, 12, T]
         std_heatmap = heatmaps_stack.std(dim=0)    # [B, 12, T]
-        
+
         return mean_prob, mean_heatmap, std_heatmap, mean_logit, std_logit
 
 
 # -----------------------
-# Checkpointing / Logging
+# Save final patch weights and tokens
 # -----------------------
-def save_checkpoint(path, model, opt, epoch, best_val_auc, args, extra=None):
-    ckpt = {
-        "epoch": epoch,
-        "best_val_auc": best_val_auc,
-        "model_state": model.state_dict(),
-        "opt_state": opt.state_dict(),
-        "args": vars(args),
-    }
-    if extra is not None:
-        ckpt["extra"] = extra
-    torch.save(ckpt, path)
-
-
-def append_metrics_csv(csv_path, row_dict):
-    header = ",".join(row_dict.keys())
-    row = ",".join([str(row_dict[k]) for k in row_dict.keys()])
-    exists = os.path.exists(csv_path)
-    with open(csv_path, "a", encoding="utf-8") as f:
-        if not exists:
-            f.write(header + "\n")
-        f.write(row + "\n")
-
-
-# -----------------------
-# Save final Wgen and tokens
-# -----------------------
-# BEST OPTIONS FOR SAVING:
-#   - npz (compressed): Default. Small size, one file, numpy-native. Use for downstream
-#     numpy/analysis, portability, or when you don't need PyTorch. Load: np.load(path)["Wgen"].
-#   - pt: Keep tensors as-is for PyTorch. Use when you'll load back into PyTorch scripts.
-#     Load: torch.load(path)["Wgen"].
-#   - h5: For very large runs (many samples) or when you need chunked/partial loading.
-#     Requires h5py. Use "all" to save all formats and compare sizes/load times.
-
-
 @torch.no_grad()
-def collect_wgen_tokens(model, loader, device, max_samples: int = None):
+def collect_patchweights_tokens(model, loader, device, max_samples: int = None):
     """
-    Run model on loader, collect Wgen [N,P,D], tokens [N,P,D], labels, logits, probs.
+    Run model on loader, collect patch_weights [N,P], tokens [N,P,D], labels, logits, probs.
     Returns dict with numpy arrays (float32) and metadata P, T, token_dim.
     """
     model.eval()
-    Wgen_list, tok_list, y_list, logit_list, prob_list = [], [], [], [], []
+    w_list, tok_list, y_list, logit_list, prob_list = [], [], [], [], []
     n = 0
     for batch in loader:
         x, y = batch
         x = x.to(device)
-        logit, Wgen, tokens, T = model.model(x)
+        logit, patch_weights, tokens, T = model.model(x)
         prob = torch.sigmoid(logit)
         B = x.size(0)
-        Wgen_list.append(Wgen.cpu().numpy())
+        w_list.append(patch_weights.cpu().numpy())
         tok_list.append(tokens.cpu().numpy())
         y_list.append(y.numpy())
         logit_list.append(logit.cpu().numpy())
@@ -629,20 +593,21 @@ def collect_wgen_tokens(model, loader, device, max_samples: int = None):
         n += B
         if max_samples is not None and n >= max_samples:
             break
-    Wgen = np.concatenate(Wgen_list, axis=0).astype(np.float32)
-    tokens = np.concatenate(tok_list, axis=0).astype(np.float32)
+    patch_weights = np.concatenate(w_list, axis=0).astype(np.float32)  # [N,P]
+    tokens = np.concatenate(tok_list, axis=0).astype(np.float32)       # [N,P,D]
     labels = np.concatenate(y_list, axis=0).astype(np.float32)
     logits = np.concatenate(logit_list, axis=0).astype(np.float32)
     probs = np.concatenate(prob_list, axis=0).astype(np.float32)
     if max_samples is not None and n > max_samples:
-        Wgen = Wgen[:max_samples]
+        patch_weights = patch_weights[:max_samples]
         tokens = tokens[:max_samples]
         labels = labels[:max_samples]
         logits = logits[:max_samples]
         probs = probs[:max_samples]
-    P, D = Wgen.shape[1], Wgen.shape[2]
+    P = patch_weights.shape[1]
+    D = tokens.shape[2]
     return {
-        "Wgen": Wgen,
+        "patch_weights": patch_weights,
         "tokens": tokens,
         "labels": labels,
         "logits": logits,
@@ -650,13 +615,13 @@ def collect_wgen_tokens(model, loader, device, max_samples: int = None):
         "P": P,
         "T": T,
         "token_dim": D,
-        "N": Wgen.shape[0],
+        "N": patch_weights.shape[0],
     }
 
 
-def save_wgen_tokens_npz(data: dict, path: str):
-    """Save as compressed npz. Load: d = np.load(path); d['Wgen'], d['tokens'], d['P'], etc."""
-    out = {k: data[k] for k in ("Wgen", "tokens", "labels", "logits", "probs")}
+def save_patchweights_tokens_npz(data: dict, path: str):
+    """Save as compressed npz."""
+    out = {k: data[k] for k in ("patch_weights", "tokens", "labels", "logits", "probs")}
     out["P"] = np.int64(data["P"])
     out["T"] = np.int64(data["T"])
     out["token_dim"] = np.int64(data["token_dim"])
@@ -664,10 +629,10 @@ def save_wgen_tokens_npz(data: dict, path: str):
     np.savez_compressed(path, **out)
 
 
-def save_wgen_tokens_pt(data: dict, path: str):
-    """Save as PyTorch .pt. Load: d = torch.load(path); d['Wgen'], d['tokens'], etc."""
+def save_patchweights_tokens_pt(data: dict, path: str):
+    """Save as PyTorch .pt."""
     out = {
-        "Wgen": torch.from_numpy(data["Wgen"]),
+        "patch_weights": torch.from_numpy(data["patch_weights"]),
         "tokens": torch.from_numpy(data["tokens"]),
         "labels": torch.from_numpy(data["labels"]),
         "logits": torch.from_numpy(data["logits"]),
@@ -680,14 +645,14 @@ def save_wgen_tokens_pt(data: dict, path: str):
     torch.save(out, path)
 
 
-def save_wgen_tokens_h5(data: dict, path: str):
+def save_patchweights_tokens_h5(data: dict, path: str):
     """Save as HDF5. Good for large data; supports partial read. Requires h5py."""
     try:
         import h5py
     except ImportError:
-        raise ImportError("save_wgen_tokens_h5 requires h5py. Install with: pip install h5py")
+        raise ImportError("save_patchweights_tokens_h5 requires h5py. Install with: pip install h5py")
     with h5py.File(path, "w") as f:
-        for k in ("Wgen", "tokens", "labels", "logits", "probs"):
+        for k in ("patch_weights", "tokens", "labels", "logits", "probs"):
             f.create_dataset(k, data=data[k], compression="gzip")
         for k in ("P", "T", "token_dim", "N"):
             f.attrs[k] = data[k]
@@ -849,11 +814,11 @@ def visualize_topk_leads_patches_to_pdf(model, dataset, device, pdf_path: str, s
             prob = float(prob.item())
             hm = heatmap.squeeze(0).detach().cpu().numpy()  # [12,T]
             x_np = x.detach().cpu().numpy()                 # [12,L]
-            
+
             # Get top-k indices
             top_leads = top_lead_indices.squeeze(0).cpu().numpy() if top_lead_indices is not None else np.array([])
             top_patches = top_patch_indices.squeeze(0).cpu().numpy() if top_patch_indices is not None else np.array([])
-            
+
             # Convert patch indices to (lead, time) coordinates
             T = hm.shape[1]
             top_patch_coords = []
@@ -873,12 +838,12 @@ def visualize_topk_leads_patches_to_pdf(model, dataset, device, pdf_path: str, s
             # Heatmap with top-k leads highlighted
             ax0 = fig.add_subplot(gs[0, 0])
             im = ax0.imshow(hm_disp, aspect="auto", vmin=-1, vmax=1, cmap="bwr")
-            
+
             # Highlight top-k leads
             for lidx in top_leads:
                 ax0.axhline(y=lidx-0.5, color='yellow', linewidth=3, alpha=0.7)
                 ax0.axhline(y=lidx+0.5, color='yellow', linewidth=3, alpha=0.7)
-            
+
             ax0.set_yticks(range(12))
             ax0.set_yticklabels(lead_names)
             ax0.set_xlabel(f"Segments (window={window}, stride={stride}, fs={sampling_rate}Hz)")
@@ -909,7 +874,7 @@ def visualize_topk_leads_patches_to_pdf(model, dataset, device, pdf_path: str, s
                         color = "red" if a > 0 else "blue"
                         start = t * stride
                         end = min(start + window, L)
-                        
+
                         # Highlight top-k patches with thicker border
                         is_top_patch = (lead, t) in top_patch_coords
                         if is_top_patch:
@@ -979,7 +944,7 @@ def visualize_uncertainty_to_pdf(model, dataset, device, pdf_path: str, sampling
             mean_prob, mean_heatmap, std_heatmap, mean_logit, std_logit = model.monte_carlo_dropout_inference(
                 x_b, n_samples=n_mc_samples
             )
-            
+
             mean_prob_val = float(mean_prob.item())
             std_logit_val = float(std_logit.item())
             mean_hm = mean_heatmap.squeeze(0).detach().cpu().numpy()  # [12,T]
@@ -988,7 +953,7 @@ def visualize_uncertainty_to_pdf(model, dataset, device, pdf_path: str, sampling
 
             denom_mean = np.max(np.abs(mean_hm)) + 1e-6
             mean_hm_disp = mean_hm / denom_mean
-            
+
             # Normalize std by max std value
             denom_std = np.max(std_hm) + 1e-6
             std_hm_disp = std_hm / denom_std
@@ -1027,21 +992,21 @@ def visualize_uncertainty_to_pdf(model, dataset, device, pdf_path: str, sampling
                 # Mean contribution shading
                 mean_contrib = mean_hm_disp[lead]  # [T]
                 std_contrib = std_hm_disp[lead]    # [T]
-                
+
                 for t in range(T):
                     a_mean = float(mean_contrib[t])
                     a_std = float(std_contrib[t])
-                    
+
                     alpha_mean = min(0.30, abs(a_mean) * 0.30)
                     alpha_std = min(0.15, a_std * 0.15)  # Uncertainty shading
-                    
+
                     start = t * stride
                     end = min(start + window, L)
-                    
+
                     if alpha_mean > 0:
                         color = "red" if a_mean > 0 else "blue"
                         ax.axvspan(start, end, alpha=alpha_mean, color=color, linewidth=0, label='Mean contribution' if t == 0 else '')
-                    
+
                     # Overlay uncertainty (darker = more uncertain)
                     if alpha_std > 0:
                         ax.axvspan(start, end, alpha=alpha_std, color='gray', linewidth=0, label='Uncertainty' if t == 0 else '')
@@ -1096,14 +1061,14 @@ def main():
     parser.add_argument("--wandb_offline", action="store_true", help="Run WandB in offline mode")
 
     # Learning Rate Scheduler
-    parser.add_argument("--scheduler", type=str, default="cosine", 
+    parser.add_argument("--scheduler", type=str, default="cosine",
                         choices=["cosine", "step", "reduce_on_plateau", "cosine_restarts", "none"],
                         help="Learning rate scheduler type")
-    parser.add_argument("--scheduler_params", type=str, default="{}", 
+    parser.add_argument("--scheduler_params", type=str, default="{}",
                         help="JSON string for scheduler parameters (e.g., '{\"T_0\": 10, \"T_mult\": 2}')")
 
     # Early Stopping
-    parser.add_argument("--early_stop_patience", type=int, default=10, 
+    parser.add_argument("--early_stop_patience", type=int, default=10,
                         help="Early stopping patience (epochs)")
     parser.add_argument("--early_stop_min_delta", type=float, default=0.0,
                         help="Minimum change to qualify as improvement")
@@ -1120,18 +1085,18 @@ def main():
     parser.add_argument("--n_neg_viz", type=int, default=25, help="Number of NORM (negative) test samples to visualize")
     parser.add_argument("--viz_random", action="store_true", help="Randomly sample positives/negatives instead of first N/M")
     parser.add_argument("--viz_seed", type=int, default=123, help="Seed for viz sampling when --viz_random is set")
-    
+
     # Top-k visualization
     parser.add_argument("--viz_topk", action="store_true", help="Enable top-k leads/patches visualization")
     parser.add_argument("--topk_leads", type=int, default=3, help="Number of top-k leads to highlight")
     parser.add_argument("--topk_patches", type=int, default=10, help="Number of top-k patches to highlight")
     parser.add_argument("--viz_topk_pdf", type=str, default="viz_topk_test.pdf", help="Output PDF filename for top-k visualization")
-    
+
     # Monte Carlo Dropout visualization
     parser.add_argument("--viz_mc_dropout", action="store_true", help="Enable Monte Carlo dropout uncertainty visualization")
     parser.add_argument("--mc_samples", type=int, default=50, help="Number of Monte Carlo samples for uncertainty estimation")
     parser.add_argument("--viz_uncertainty_pdf", type=str, default="viz_uncertainty_test.pdf", help="Output PDF filename for uncertainty visualization")
-    
+
     parser.add_argument("--verbose", action="store_true", help="Verbose mode")
 
     # Checkpoints / run directory
@@ -1139,22 +1104,22 @@ def main():
     parser.add_argument("--exp_name", type=str, default=None,
                         help="Optional experiment name; included in run dir as {script}_{exp_name}_{timestamp}")
 
-    # Save final Wgen and tokens
-    parser.add_argument("--save_wgen_tokens", action="store_true",
-                        help="Save final Wgen and tokens after evaluation")
-    parser.add_argument("--save_wgen_tokens_format", type=str, default="npz",
+    # Save final patch weights and tokens
+    parser.add_argument("--save_patch_weights", action="store_true",
+                        help="Save final patch weights and tokens after evaluation")
+    parser.add_argument("--save_patch_weights_format", type=str, default="npz",
                         choices=["npz", "pt", "h5", "all"],
                         help="Format: npz (compressed, default), pt (PyTorch), h5 (HDF5), all")
-    parser.add_argument("--save_wgen_tokens_split", type=str, default="test",
+    parser.add_argument("--save_patch_weights_split", type=str, default="test",
                         choices=["test", "val", "both"],
                         help="Which split to save: test, val, or both")
-    parser.add_argument("--save_wgen_tokens_max_samples", type=int, default=None,
+    parser.add_argument("--save_patch_weights_max_samples", type=int, default=None,
                         help="Cap number of samples to save (default: all)")
 
     args = parser.parse_args()
 
     set_seed(args.seed)
-    
+
     # Parse scheduler params
     import json
     try:
@@ -1284,7 +1249,7 @@ def main():
         save_dir=run_dir,
         offline=args.wandb_offline,
     )
-    
+
     # Log hyperparameters
     wandb_logger.log_hyperparams(vars(args))
     wandb_logger.log_hyperparams({
@@ -1296,7 +1261,7 @@ def main():
 
     # Setup callbacks
     callbacks = []
-    
+
     # Early stopping
     early_stop = EarlyStopping(
         monitor=args.early_stop_monitor,
@@ -1306,7 +1271,7 @@ def main():
         verbose=True,
     )
     callbacks.append(early_stop)
-    
+
     # Model checkpointing
     checkpoint_callback = ModelCheckpoint(
         dirpath=run_dir,
@@ -1318,7 +1283,7 @@ def main():
         verbose=True,
     )
     callbacks.append(checkpoint_callback)
-    
+
     # Learning rate monitor
     lr_monitor = LearningRateMonitor(logging_interval="epoch")
     callbacks.append(lr_monitor)
@@ -1374,13 +1339,13 @@ def main():
         seed=args.viz_seed
     )
     print("Done.")
-    
+
     # Top-k leads and patches visualization
     if args.viz_topk:
         topk_pdf_path = args.viz_topk_pdf
         if not os.path.isabs(topk_pdf_path):
             topk_pdf_path = os.path.join(run_dir, topk_pdf_path)
-        
+
         print(f"\n📊 Saving top-k leads/patches visualizations to: {topk_pdf_path}")
         visualize_topk_leads_patches_to_pdf(
             model=model,
@@ -1398,13 +1363,13 @@ def main():
             seed=args.viz_seed
         )
         print("Top-k visualization done.")
-    
+
     # Monte Carlo Dropout uncertainty visualization
     if args.viz_mc_dropout:
         uncertainty_pdf_path = args.viz_uncertainty_pdf
         if not os.path.isabs(uncertainty_pdf_path):
             uncertainty_pdf_path = os.path.join(run_dir, uncertainty_pdf_path)
-        
+
         print(f"\n📊 Saving Monte Carlo dropout uncertainty visualizations to: {uncertainty_pdf_path}")
         print(f"   Running {args.mc_samples} MC samples per test sample...")
         visualize_uncertainty_to_pdf(
@@ -1423,11 +1388,11 @@ def main():
         )
         print("Uncertainty visualization done.")
 
-    # Save final Wgen and tokens
-    if args.save_wgen_tokens:
-        fmt = args.save_wgen_tokens_format
-        split_choice = args.save_wgen_tokens_split
-        max_samp = args.save_wgen_tokens_max_samples
+    # Save final patch weights and tokens
+    if args.save_patch_weights:
+        fmt = args.save_patch_weights_format
+        split_choice = args.save_patch_weights_split
+        max_samp = args.save_patch_weights_max_samples
         splits = []
         loaders = {}
         if split_choice in ("test", "both"):
@@ -1438,26 +1403,26 @@ def main():
             loaders["val"] = val_loader
         for sp in splits:
             loader = loaders[sp]
-            print(f"\n📦 Collecting Wgen/tokens for {sp} split (max_samples={max_samp})...")
-            data = collect_wgen_tokens(model, loader, device, max_samples=max_samp)
+            print(f"\n📦 Collecting patch_weights/tokens for {sp} split (max_samples={max_samp})...")
+            data = collect_patchweights_tokens(model, loader, device, max_samples=max_samp)
             print(f"   N={data['N']}, P={data['P']}, T={data['T']}, token_dim={data['token_dim']}")
-            base = os.path.join(run_dir, f"wgen_tokens_{sp}")
+            base = os.path.join(run_dir, f"patchweights_tokens_{sp}")
             if fmt == "npz" or fmt == "all":
                 p = base + ".npz"
-                save_wgen_tokens_npz(data, p)
+                save_patchweights_tokens_npz(data, p)
                 print(f"   Saved npz: {p}")
             if fmt == "pt" or fmt == "all":
                 p = base + ".pt"
-                save_wgen_tokens_pt(data, p)
+                save_patchweights_tokens_pt(data, p)
                 print(f"   Saved pt:  {p}")
             if fmt == "h5" or fmt == "all":
                 try:
                     p = base + ".h5"
-                    save_wgen_tokens_h5(data, p)
+                    save_patchweights_tokens_h5(data, p)
                     print(f"   Saved h5: {p}")
                 except ImportError as e:
                     print(f"   Skipped h5: {e}")
-        print("Done saving Wgen/tokens.")
+        print("Done saving patch_weights/tokens.")
 
     # Finish WandB run
     wandb.finish()
@@ -1465,3 +1430,4 @@ def main():
 
 if __name__ == "__main__":
     main()
+
