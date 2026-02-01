@@ -1,5 +1,8 @@
 """
-ECG Patch IMN (Lightning) — with optional save of final Wgen and tokens.
+ECG Patch IMN (Lightning) — GatedAttnPool variant.
+
+Same as save_wgen_tokens script, but replaces tokens.mean(dim=1) with GatedAttnPool
+(attention-weighted pooling over patches). Use --pool_hidden to set attention MLP hidden dim.
 
 Use --save_wgen_tokens to save Wgen [N,P,D] and tokens [N,P,D] plus labels, logits, probs.
 Formats: --save_wgen_tokens_format npz|pt|h5|all. Splits: --save_wgen_tokens_split test|val|both.
@@ -121,6 +124,25 @@ def patchify_ecg_overlap(x: torch.Tensor, window: int, stride: int):
 
 
 # -----------------------
+# Gated attention pooling (replaces mean pooling over tokens)
+# -----------------------
+class GatedAttnPool(nn.Module):
+    def __init__(self, d, hidden=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(d, hidden),
+            nn.Tanh(),
+            nn.Linear(hidden, 1)
+        )
+
+    def forward(self, tokens):  # [B,P,D]
+        a = self.net(tokens).squeeze(-1)         # [B,P]
+        a = torch.softmax(a, dim=1)              # [B,P]
+        g = (tokens * a.unsqueeze(-1)).sum(dim=1)  # [B,D]
+        return g, a
+
+
+# -----------------------
 # Model: Patch-wise IMN (binary) with overlap support
 # -----------------------
 class ECGPatchIMN(nn.Module):
@@ -131,7 +153,7 @@ class ECGPatchIMN(nn.Module):
     - Hypernet(g) -> instance-specific linear weights over tokens
     - logit = sum_{p,d} W_{p,d} * token_{p,d} + b
     """
-    def __init__(self, signal_len: int, window: int, stride: int, token_dim: int = 64, hyper_hidden: int = 256, dropout: float = 0.1, verbose: bool = False):
+    def __init__(self, signal_len: int, window: int, stride: int, token_dim: int = 64, hyper_hidden: int = 256, pool_hidden: int = 128, dropout: float = 0.1, verbose: bool = False):
         super().__init__()
         self.signal_len = signal_len
         self.window = window
@@ -142,6 +164,8 @@ class ECGPatchIMN(nn.Module):
         # Compute T, P deterministically from L, window, stride
         self.T = (signal_len - window) // stride + 1
         self.P = 12 * self.T
+
+        self.pool = GatedAttnPool(token_dim, hidden=pool_hidden)
 
         self.patch_embed = nn.Sequential(
             nn.Conv1d(1, 16, kernel_size=9, padding=4),
@@ -206,9 +230,10 @@ class ECGPatchIMN(nn.Module):
         if verbose:
             print(f"[Forward] After reshape to tokens: tokens shape: {tokens.shape}")
 
-        g = self.g_proj(tokens.mean(dim=1))             # [B,D]
+        g_pooled, _ = self.pool(tokens)                 # g_pooled [B,D]
+        g = self.g_proj(g_pooled)                       # [B,D]
         if verbose:
-            print(f"[Forward] After g_proj: g shape: {g.shape}")
+            print(f"[Forward] After pool + g_proj: g shape: {g.shape}")
         
         out = self.hyper(g)                             # [B, P*D+1]
         if verbose:
@@ -283,15 +308,15 @@ class ECGPatchIMN(nn.Module):
         patches_ = patches.view(B * P, 1, W)
         tok = self.patch_embed(patches_)                # [B*P,D]
         tokens = tok.view(B, P, self.token_dim)         # [B,P,D]
-        
-        g = self.g_proj(tokens.mean(dim=1))             # [B,D]
+
+        g_pooled, _ = self.pool(tokens)                 # g_pooled [B,D]
+        g = self.g_proj(g_pooled)                       # [B,D]
         out = self.hyper(g)                             # [B, P*D+1]
-        
+
         Wgen = out[:, :-1].view(B, P, self.token_dim)   # [B,P,D]
         b = out[:, -1]                                  # [B]
-        
+
         logit = (Wgen * tokens).sum(dim=(1, 2)) + b
-        
         return logit, Wgen, tokens, T
 
 
@@ -329,6 +354,7 @@ class ECGPatchIMNLightning(pl.LightningModule):
         stride: int,
         token_dim: int = 64,
         hyper_hidden: int = 256,
+        pool_hidden: int = 128,
         dropout: float = 0.1,
         lr: float = 1e-3,
         weight_decay: float = 1e-4,
@@ -347,6 +373,7 @@ class ECGPatchIMNLightning(pl.LightningModule):
             stride=stride,
             token_dim=token_dim,
             hyper_hidden=hyper_hidden,
+            pool_hidden=pool_hidden,
             dropout=dropout,
             verbose=verbose
         )
@@ -1070,6 +1097,7 @@ def main():
     parser.add_argument("--l1_lambda", type=float, default=0.05)
     parser.add_argument("--token_dim", type=int, default=64)
     parser.add_argument("--hyper_hidden", type=int, default=256)
+    parser.add_argument("--pool_hidden", type=int, default=128, help="Hidden dim for GatedAttnPool")
 
     # Patching
     parser.add_argument("--window", type=int, default=None,
@@ -1127,8 +1155,10 @@ def main():
     
     parser.add_argument("--verbose", action="store_true", help="Verbose mode")
 
-    # Checkpoints
+    # Checkpoints / run directory
     parser.add_argument("--out_dir", type=str, default="runs/mi_vs_norm_imn", help="Directory for checkpoints/logs")
+    parser.add_argument("--exp_name", type=str, default=None,
+                        help="Optional experiment name; included in run dir as {script}_{exp_name}_{timestamp}")
 
     # Save final Wgen and tokens
     parser.add_argument("--save_wgen_tokens", action="store_true",
@@ -1154,10 +1184,17 @@ def main():
         scheduler_params = {}
 
     # -------------------------------------------------
-    # Create timestamped run directory
+    # Create run directory: {out_dir}/{script_name}[_{exp_name}]_{timestamp}
     # -------------------------------------------------
+    script_basename = os.path.splitext(os.path.basename(__file__))[0]
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
-    run_dir = os.path.join(args.out_dir, timestamp)
+    run_name = script_basename
+    if args.exp_name is not None and args.exp_name.strip():
+        exp = args.exp_name.strip().replace(" ", "_")
+        exp = "".join(c for c in exp if c.isalnum() or c in "._-") or "exp"
+        run_name = f"{script_basename}_{exp}"
+    run_name = f"{run_name}_{timestamp}"
+    run_dir = os.path.join(args.out_dir, run_name)
     os.makedirs(run_dir, exist_ok=True)
 
     print(f"📁 Run directory: {run_dir}")
@@ -1250,6 +1287,7 @@ def main():
         stride=stride,
         token_dim=args.token_dim,
         hyper_hidden=args.hyper_hidden,
+        pool_hidden=args.pool_hidden,
         dropout=0.1,
         lr=args.lr,
         weight_decay=args.weight_decay,
@@ -1261,7 +1299,7 @@ def main():
     )
 
     # Setup WandB logger
-    wandb_name = args.wandb_name or timestamp
+    wandb_name = args.wandb_name or run_name
     wandb_logger = WandbLogger(
         project=args.wandb_project,
         name=wandb_name,
@@ -1276,6 +1314,7 @@ def main():
         "stride": stride,
         "signal_len": L,
         "pos_weight": pos_weight,
+        "pool_hidden": args.pool_hidden,
     })
 
     # Setup callbacks
