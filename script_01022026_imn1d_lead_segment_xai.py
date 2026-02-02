@@ -1,25 +1,23 @@
 """
-PTB-XL MI vs NORM baseline (2D CNN) + Grad-CAM using jacobgil/pytorch-grad-cam + PDF report.
+PTB-XL binary baseline with IMN-style network using 1D path embedding for lead-wise + segment-wise XAI.
 
-- Model: simple 2D CNN on ECG "image" [B,1,12,L]
-- Loss: CrossEntropy (2 classes: 0=NORM, 1=MI) with optional class weights
-- XAI: GradCAM from pytorch-grad-cam (jacobgil) on the last conv layer
-- PDF: pick N positives (MI) and M negatives (NORM) from TEST, visualize:
-      (1) lead x segments heatmap (GradCAM averaged into segments)
-      (2) 12 lead plots with red shading by segment importance
-- Splits: train folds 1-8, val fold 9, test fold 10
-- Sampling rate: 100 or 500
-- Run dir: runs/.../<timestamp> with args.yaml, metrics.csv, last.pt, best.pt, model.txt, pdf
+- Model: IMN with 1D CNN patch embedding (same as script_25012026_v3_Selected_01_lightning_save_wgen_tokens).
+    - Patches: P = 12*T (one per lead × segment), each patch = [window] samples from a single lead.
+  - Patch embed: 1D CNN on [1, window] -> token_dim.
+  - Hyper net: 2D CNN on token grid [B, 1, 12, T] (reshape from [B,P,D]) -> pool -> linear -> Wgen [B,P,D], b; logit = (Wgen*tokens).sum + b.
+  - Output: logits [B,2] for CE (0=NORM, 1=pos_class).
+- XAI: Native IMN heatmap [B,12,T] — TRUE per-lead per-segment contributions (not broadcast).
+- PDF: N positives and M negatives, heatmap + 12 lead plots with shading by lead×segment importance.
+- Same splits/task/sampling as script_26012026_imn2d_gradcam_baseline.py.
 
 Run:
-python baseline_ptbxl_2d_gradcam_jacobgil.py --path /path/to/ptbxl --sampling_rate 500 --epochs 20 --viz_random
+python script_01022026_imn1d_lead_segment_xai.py --path /path/to/ptbxl --sampling_rate 500 --epochs 20 --viz_random
 """
 
 import argparse
 import ast
 import json
 import os
-import time
 import random
 import numpy as np
 import pandas as pd
@@ -48,10 +46,6 @@ from sklearn.metrics import (
     matthews_corrcoef,
     roc_auc_score,
 )
-
-# Jacobgil Grad-CAM
-from pytorch_grad_cam import GradCAM
-from pytorch_grad_cam.utils.model_targets import ClassifierOutputTarget
 
 
 # -----------------------
@@ -98,7 +92,7 @@ def build_superclasses(path: str):
 class PTBXLBinaryDatasetCE(Dataset):
     """
     X: [N, 12, L]
-    y: [N] int64 {0,1}   0=NORM, 1=MI
+    y: [N] int64 {0,1}   0=NORM, 1=pos_class
     """
     def __init__(self, X: torch.Tensor, y: torch.Tensor, per_lead_zscore: bool = True):
         super().__init__()
@@ -124,55 +118,127 @@ class PTBXLBinaryDatasetCE(Dataset):
 
 
 # -----------------------
-# 2D CNN baseline
+# 1D overlapping patchify: [B,12,L] -> [B,P,W], P=12*T
 # -----------------------
-class ECGConv2DBaseline(nn.Module):
+def patchify_ecg_overlap(x: torch.Tensor, window: int, stride: int):
     """
-    Input:  x [B,12,L]
-    Output: logits [B,2]  (class 0=NORM, 1=MI)
+    x: [B,12,L]
+    returns patches: [B, 12*T, window], and T
+    Patch order: lead 0 seg 0..T-1, lead 1 seg 0..T-1, ... -> heatmap[lead,t] = patch_scores[lead*T+t]
     """
-    def __init__(self, dropout: float = 0.2):
-        super().__init__()
-        self.conv1 = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=(3, 15), padding=(1, 7), bias=False),
-            nn.BatchNorm2d(16),
-            nn.GELU(),
-        )
-        self.conv2 = nn.Sequential(
-            nn.Conv2d(16, 32, kernel_size=(3, 15), padding=(1, 7), bias=False),
-            nn.BatchNorm2d(32),
-            nn.GELU(),
-            nn.MaxPool2d(kernel_size=(1, 2)),  # downsample time only
-        )
-        self.conv3 = nn.Sequential(
-            nn.Conv2d(32, 64, kernel_size=(3, 15), padding=(1, 7), bias=False),
-            nn.BatchNorm2d(64),
-            nn.GELU(),
-            nn.MaxPool2d(kernel_size=(1, 2)),  # downsample time only
-        )
-        # target layer for Grad-CAM: use last conv block output
-        self.target_layer = self.conv3[0]  # the Conv2d(32->64)
-
-        self.dropout = nn.Dropout(dropout)
-        self.fc = nn.Linear(64, 2)
-
-    def forward(self, x):
-        x = x.unsqueeze(1)            # [B,1,12,L]
-        h = self.conv1(x)
-        h = self.conv2(h)
-        h = self.conv3(h)             # [B,64,12,L']
-        g = h.mean(dim=(2, 3))        # [B,64] global avg pool
-        g = self.dropout(g)
-        logits = self.fc(g)           # [B,2]
-        return logits
+    B, C, L = x.shape
+    assert C == 12
+    assert window <= L
+    assert stride > 0
+    x_unf = x.unfold(dimension=2, size=window, step=stride)  # [B,12,T,window]
+    T = x_unf.shape[2]
+    patches = x_unf.contiguous().view(B, 12 * T, window)
+    return patches, T
 
 
 # -----------------------
-# Lightning Module (wraps ECGConv2DBaseline)
+# IMN with 1D CNN patch embedding (lead-wise + segment-wise)
 # -----------------------
-class Conv2DBaselineLightning(pl.LightningModule):
+class ECGPatchIMN1D(nn.Module):
+    """
+    IMN-style model with 1D CNN patch embedding and 2D CNN hypernetwork.
+    - Patches: P = 12*T (one per lead×time segment).
+    - Patch embed: 1D CNN on [1, window] -> token_dim.
+    - Hyper net: 2D CNN on token grid [B, 1, P, D] -> pool -> linear -> Wgen [B,P,D], b.
+    - logit = (Wgen*tokens).sum + b; output logits [B,2] for CE.
+    - explain(): heatmap [B,12,T] with TRUE per-lead per-segment signed contributions.
+    """
     def __init__(
         self,
+        signal_len: int,
+        window: int,
+        stride: int,
+        token_dim: int = 64,
+        hyper_hidden: int = 256,
+        dropout: float = 0.2,
+    ):
+        super().__init__()
+        self.signal_len = signal_len
+        self.window = window
+        self.stride = stride
+        self.token_dim = token_dim
+
+        self.T = (signal_len - window) // stride + 1
+        self.P = 12 * self.T
+
+        self.patch_embed = nn.Sequential(
+            nn.Conv1d(1, 16, kernel_size=9, padding=4),
+            nn.GELU(),
+            nn.Conv1d(16, 32, kernel_size=9, padding=4),
+            nn.GELU(),
+            nn.AdaptiveAvgPool1d(1),
+            nn.Flatten(),
+            nn.Linear(32, token_dim),
+            nn.GELU(),
+        )
+
+        # Hypernetwork as 2D CNN: token grid [B, 1, 12, T] (or [B, 1, P, D]) -> convs -> pool -> linear -> Wgen, b
+        # Reshape tokens [B, 12*T, D] -> [B, 1, 12*T, D] for 2D conv (spatial dims: patches × features)
+        self.hyper_conv = nn.Sequential(
+            nn.Conv2d(1, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            nn.Conv2d(32, hyper_hidden, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(hyper_hidden),
+            nn.GELU(),
+            nn.AdaptiveAvgPool2d(1),
+            nn.Flatten(),
+            nn.Dropout(dropout),
+        )
+        self.hyper_linear = nn.Linear(hyper_hidden, self.P * token_dim + 1)
+
+    def _forward_full(self, x):
+        """Returns logits [B,2], Wgen [B,P,D], tokens [B,P,D], T."""
+        B = x.shape[0]
+        patches, T = patchify_ecg_overlap(x, self.window, self.stride)  # [B,P,W]
+        assert T == self.T
+        p = patches.view(B * self.P, 1, self.window)
+        tok = self.patch_embed(p)
+        tokens = tok.view(B, self.P, self.token_dim)
+
+        # Hyper 2D CNN: token grid [B, P, D] -> [B, 1, P, D]
+        token_grid = tokens.unsqueeze(1)  # [B, 1, 12*T, D]
+        h = self.hyper_conv(token_grid)   # [B, hyper_hidden]
+        out = self.hyper_linear(h)        # [B, P*D+1]
+        Wgen = out[:, :-1].view(B, self.P, self.token_dim)
+        b = out[:, -1]
+
+        logit_scalar = (Wgen * tokens).sum(dim=(1, 2)) + b
+        logits = torch.stack([-logit_scalar, logit_scalar], dim=1)  # [B,2]
+        return logits, Wgen, tokens, T
+
+    def forward(self, x):
+        logits, _, _, _ = self._forward_full(x)
+        return logits
+
+    @torch.no_grad()
+    def explain(self, x):
+        """
+        Returns prob [B], heatmap [B,12,T] — per-lead per-segment signed contributions.
+        """
+        logits, Wgen, tokens, T = self._forward_full(x)
+        prob = F.softmax(logits, dim=1)[:, 1]
+        patch_scores = (Wgen * tokens).sum(dim=-1)  # [B,P]
+        heatmap = patch_scores.view(x.size(0), 12, T)  # [B,12,T] lead-wise, segment-wise
+        return prob, heatmap
+
+
+# -----------------------
+# Lightning module (CE, class weights, val_auc)
+# -----------------------
+class IMN1DLightning(pl.LightningModule):
+    def __init__(
+        self,
+        signal_len: int,
+        window: int,
+        stride: int,
+        token_dim: int = 64,
+        hyper_hidden: int = 256,
         dropout: float = 0.2,
         lr: float = 1e-3,
         weight_decay: float = 1e-4,
@@ -186,7 +252,14 @@ class Conv2DBaselineLightning(pl.LightningModule):
         self.scheduler_type = scheduler_type
         self.scheduler_params = scheduler_params or {}
 
-        self.model = ECGConv2DBaseline(dropout=dropout)
+        self.model = ECGPatchIMN1D(
+            signal_len=signal_len,
+            window=window,
+            stride=stride,
+            token_dim=token_dim,
+            hyper_hidden=hyper_hidden,
+            dropout=dropout,
+        )
 
         self.lr = lr
         self.weight_decay = weight_decay
@@ -274,7 +347,7 @@ class Conv2DBaselineLightning(pl.LightningModule):
         logits = self.model(x)
         loss = F.cross_entropy(logits, y, weight=self._ce_weight())
 
-        prob = torch.softmax(logits, dim=1)[:, 1]
+        prob = F.softmax(logits, dim=1)[:, 1]
         pred = logits.argmax(dim=1)
         acc = (pred == y).float().mean()
 
@@ -287,12 +360,9 @@ class Conv2DBaselineLightning(pl.LightningModule):
     def on_validation_epoch_end(self):
         y_true = torch.cat(self.val_y) if len(self.val_y) else None
         y_score = torch.cat(self.val_probs) if len(self.val_probs) else None
-        if y_true is None:
-            return
-
-        auc = simple_auc_roc(y_true.float(), y_score.float())
-        self.log("val_auc", auc, on_step=False, on_epoch=True, prog_bar=True)
-
+        if y_true is not None:
+            auc = simple_auc_roc(y_true.float(), y_score.float())
+            self.log("val_auc", auc, on_step=False, on_epoch=True, prog_bar=True)
         self.val_probs.clear()
         self.val_y.clear()
 
@@ -301,7 +371,7 @@ class Conv2DBaselineLightning(pl.LightningModule):
         logits = self.model(x)
         loss = F.cross_entropy(logits, y, weight=self._ce_weight())
 
-        prob = torch.softmax(logits, dim=1)[:, 1]
+        prob = F.softmax(logits, dim=1)[:, 1]
         pred = logits.argmax(dim=1)
         acc = (pred == y).float().mean()
 
@@ -316,10 +386,6 @@ class Conv2DBaselineLightning(pl.LightningModule):
 # -----------------------
 @torch.no_grad()
 def simple_auc_roc(y_true: torch.Tensor, y_score: torch.Tensor) -> float:
-    """
-    y_true: [N] {0,1}
-    y_score: [N] probability for class 1
-    """
     y_true = y_true.detach().cpu().float()
     y_score = y_score.detach().cpu().float()
     if y_true.min() == y_true.max():
@@ -339,88 +405,33 @@ def simple_auc_roc(y_true: torch.Tensor, y_score: torch.Tensor) -> float:
 
 
 # -----------------------
-# Grad-CAM helpers
+# PDF visualization: per-lead per-segment heatmap + 12 lead plots
 # -----------------------
-def cam_to_segments(cam_12L: np.ndarray, window: int, stride: int) -> np.ndarray:
+def visualize_pos_neg_to_pdf_imn1d(
+    model,
+    dataset,
+    device,
+    pdf_path: str,
+    sampling_rate: int,
+    window: int,
+    stride: int,
+    n_pos: int,
+    n_neg: int,
+    pos_class_name: str = "MI",
+    random_pick: bool = False,
+    seed: int = 123,
+    lead_names=None,
+):
     """
-    cam_12L: [12,L] in [0,1]
-    returns [12,T] in [0,1]
-    """
-    assert cam_12L.ndim == 2 and cam_12L.shape[0] == 12
-    L = cam_12L.shape[1]
-    assert window <= L and stride > 0
-    T = (L - window) // stride + 1
-    seg = np.zeros((12, T), dtype=np.float32)
-    for t in range(T):
-        s = t * stride
-        e = min(s + window, L)
-        seg[:, t] = cam_12L[:, s:e].mean(axis=1)
-    # normalize per record for display
-    mx = float(seg.max()) + 1e-6
-    seg = seg / mx
-    return seg
-
-
-def ensure_cam_size(cam_hw: np.ndarray, H: int, W: int) -> np.ndarray:
-    """
-    pytorch-grad-cam usually returns CAM in input resolution, but we make it robust:
-    if cam is not [H,W], resize with torch interpolate.
-    cam_hw: [Hc,Wc]
-    """
-    if cam_hw.shape == (H, W):
-        return cam_hw
-    t = torch.from_numpy(cam_hw).float()[None, None, :, :]  # [1,1,Hc,Wc]
-    t = F.interpolate(t, size=(H, W), mode="bilinear", align_corners=False)
-    return t[0, 0].cpu().numpy()
-
-
-# -----------------------
-# Wrapper model for Grad-CAM (expects [B,C,H,W] input)
-# -----------------------
-class GradCAMWrapper(nn.Module):
-    """Wrapper that accepts [B,C,H,W] and calls model's conv layers directly"""
-    def __init__(self, base_model: ECGConv2DBaseline):
-        super().__init__()
-        self.conv1 = base_model.conv1
-        self.conv2 = base_model.conv2
-        self.conv3 = base_model.conv3
-        self.dropout = base_model.dropout
-        self.fc = base_model.fc
-    
-    def forward(self, x):
-        # x is already [B,1,12,L] - no unsqueeze needed
-        h = self.conv1(x)
-        h = self.conv2(h)
-        h = self.conv3(h)             # [B,64,12,L']
-        g = h.mean(dim=(2, 3))        # [B,64] global avg pool
-        g = self.dropout(g)
-        logits = self.fc(g)           # [B,2]
-        return logits
-
-
-# -----------------------
-# Visualization to PDF using pytorch-grad-cam
-# -----------------------
-def visualize_pos_neg_to_pdf_gradcam(model, dataset, device, pdf_path: str,
-                                     sampling_rate: int, window: int, stride: int,
-                                     n_pos: int, n_neg: int,
-                                     pos_class_name: str = "MI",
-                                     random_pick: bool = False, seed: int = 123,
-                                     lead_names=None):
-    """
-    Multi-page PDF:
-      - N positives and M NORM from dataset (first or random)
-      - Each page: heatmap (lead x segments) + 12 lead plots with shaded importance
+    Multi-page PDF: N positives and M negatives.
+    Each page: IMN heatmap [12,T] (per-lead per-segment) + 12 lead plots with shading by lead×segment importance.
+    Unlike 2D IMN, heatmap has distinct values per lead — true lead-wise and segment-wise explanations.
     """
     model.eval()
     if lead_names is None:
-        lead_names = ["I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"]
+        lead_names = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
 
     os.makedirs(os.path.dirname(pdf_path) or ".", exist_ok=True)
-    
-    # Create wrapper model for Grad-CAM (expects [B,C,H,W] format)
-    gradcam_model = GradCAMWrapper(model).to(device)
-    gradcam_model.eval()
 
     pos_idx, neg_idx = [], []
     for i in range(len(dataset)):
@@ -445,83 +456,65 @@ def visualize_pos_neg_to_pdf_gradcam(model, dataset, device, pdf_path: str,
 
     selected = [(pos_class_name, i) for i in sel_pos] + [("NORM", i) for i in sel_neg]
 
-    # GradCAM object (jacobgil) — reuse across samples
-    # Use wrapper model which expects [B,C,H,W] format
-    target_layers = [gradcam_model.conv3[0]]  # Conv2d layer for Grad-CAM
-    with GradCAM(model=gradcam_model, target_layers=target_layers) as cam:
-        with PdfPages(pdf_path) as pdf:
-            for tag, idx in selected:
-                x, y = dataset[idx]                      # x: [12,L], y: scalar int
-                x_b = x.unsqueeze(0).to(device)          # [1,12,L]
+    with PdfPages(pdf_path) as pdf:
+        for tag, idx in selected:
+            x, y = dataset[idx]
+            x_b = x.unsqueeze(0).to(device)
 
-                # Forward prob (no gradients needed here)
-                with torch.no_grad():
-                    logits = model(x_b)                      # [1,2]
-                    prob = float(torch.softmax(logits, dim=1)[0, 1].item())
+            with torch.no_grad():
+                prob, heatmap = model.explain(x_b)
+                prob = float(prob.item())
+                hm = heatmap.squeeze(0).cpu().numpy()  # [12,T] per-lead per-segment
+                x_np = x.detach().cpu().numpy()        # [12,L]
 
-                # GradCAM expects [B,C,H,W] format (image-like)
-                # Convert [1,12,L] to [1,1,12,L] for Grad-CAM library
-                input_tensor = x_b.unsqueeze(1).requires_grad_(True)  # [1,1,12,L]
+            denom = np.max(np.abs(hm)) + 1e-6
+            hm_disp = hm / denom
 
-                # Explain class 1 (MI)
-                targets = [ClassifierOutputTarget(1)]
-                grayscale_cam = cam(input_tensor=input_tensor, targets=targets)  # [B,H,W] numpy
+            Lsig = x_np.shape[1]
+            Tseg = hm.shape[1]
 
-                cam_hw = grayscale_cam[0]                # [12,L] or possibly [12,L'] depending on internals
-                cam_hw = ensure_cam_size(cam_hw, H=12, W=x.shape[1])
+            fig = plt.figure(figsize=(11.7, 16.5))
+            gs = fig.add_gridspec(14, 1, height_ratios=[2] + [1] * 12 + [0.5])
 
-                # Normalize to [0,1] per record for display
-                cam_hw = cam_hw - cam_hw.min()
-                cam_hw = cam_hw / (cam_hw.max() + 1e-6)
+            ax0 = fig.add_subplot(gs[0, 0])
+            im = ax0.imshow(hm_disp, aspect="auto", vmin=-1, vmax=1, cmap="bwr")
+            ax0.set_yticks(range(12))
+            ax0.set_yticklabels(lead_names)
+            ax0.set_xlabel(f"Segments (window={window}, stride={stride}, fs={sampling_rate}Hz)")
+            ax0.set_title(f"{tag} | true={int(y.item())} | P({pos_class_name})={prob:.3f} | idx={idx} | 1D lead×segment XAI")
+            fig.colorbar(im, ax=ax0, fraction=0.02, pad=0.01)
 
-                # Segment heatmap [12,T]
-                seg_hm = cam_to_segments(cam_hw, window=window, stride=stride)
-                Tseg = seg_hm.shape[1]
-                Lsig = x.shape[1]
+            for lead in range(12):
+                ax = fig.add_subplot(gs[lead + 1, 0])
+                ax.plot(x_np[lead], linewidth=0.8)
+                ax.set_xlim(0, Lsig - 1)
+                ax.set_ylabel(lead_names[lead], rotation=0, labelpad=20, va="center")
 
-                # Convert to numpy (no gradients needed)
-                with torch.no_grad():
-                    x_np = x.detach().cpu().numpy()          # [12,L]
+                contrib = hm_disp[lead]  # [T] — unique per lead
+                for t in range(Tseg):
+                    a = float(contrib[t])
+                    alpha = min(0.35, abs(a) * 0.35)
+                    if alpha > 0:
+                        color = "red" if a > 0 else "blue"
+                        start = t * stride
+                        end = min(start + window, Lsig)
+                        ax.axvspan(start, end, alpha=alpha, color=color, linewidth=0)
 
-                fig = plt.figure(figsize=(11.7, 16.5))
-                gs = fig.add_gridspec(14, 1, height_ratios=[2] + [1]*12 + [0.5])
+                ax.set_xticks([])
 
-                ax0 = fig.add_subplot(gs[0, 0])
-                im = ax0.imshow(seg_hm, aspect="auto", vmin=0, vmax=1, cmap="Reds")
-                ax0.set_yticks(range(12))
-                ax0.set_yticklabels(lead_names)
-                ax0.set_xlabel(f"Segments (window={window}, stride={stride}, fs={sampling_rate}Hz)")
-                ax0.set_title(f"{tag} | true={int(y.item())} | P({pos_class_name})={prob:.3f} | idx={idx}")
-                fig.colorbar(im, ax=ax0, fraction=0.02, pad=0.01)
+            axf = fig.add_subplot(gs[13, 0])
+            axf.axis("off")
+            axf.text(
+                0, 0.5,
+                "IMN 1D path embedding: per-lead per-segment contributions. Red=positive class, Blue=negative. Normalized per record.",
+                fontsize=10
+            )
 
-                for lead in range(12):
-                    ax = fig.add_subplot(gs[lead + 1, 0])
-                    ax.plot(x_np[lead], linewidth=0.8)
-                    ax.set_xlim(0, Lsig - 1)
-                    ax.set_ylabel(lead_names[lead], rotation=0, labelpad=20, va="center")
+            fig.tight_layout()
+            pdf.savefig(fig)
+            plt.close(fig)
 
-                    contrib = seg_hm[lead]  # [Tseg], 0..1
-                    for t in range(Tseg):
-                        a = float(contrib[t])
-                        alpha = min(0.35, a * 0.35)
-                        if alpha > 0:
-                            start = t * stride
-                            end = min(start + window, Lsig)
-                            ax.axvspan(start, end, alpha=alpha, color="red", linewidth=0)
-
-                    ax.set_xticks([])
-
-                axf = fig.add_subplot(gs[13, 0])
-                axf.axis("off")
-                axf.text(
-                    0, 0.5,
-                    f"Grad-CAM importance (0..1) for class {pos_class_name} (post-hoc). Darker red = higher importance.",
-                    fontsize=10
-                )
-
-                fig.tight_layout()
-                pdf.savefig(fig)
-                plt.close(fig)
+    print(f"Saved IMN 1D lead×segment visualization PDF: {pdf_path}")
 
 
 # -----------------------
@@ -532,59 +525,44 @@ def main():
     parser.add_argument("--path", type=str, required=True, help="path/to/ptbxl/")
     parser.add_argument("--sampling_rate", type=int, default=500, choices=[100, 500])
 
-    # Binary classification task (NORM vs X)
     parser.add_argument("--task", type=str, default="norm_vs_mi",
                         choices=["norm_vs_mi", "norm_vs_sttc", "norm_vs_cd", "norm_vs_hyp"],
                         help="Binary task: norm_vs_mi, norm_vs_sttc, norm_vs_cd, norm_vs_hyp")
 
-    # Training
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=64)
     parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--dropout", type=float, default=0.2)
 
-    # Visualization segmentation
     parser.add_argument("--window", type=int, default=None,
-                        help="Window in samples. Default: 0.5s => 50@100Hz or 250@500Hz.")
+                        help="Patch window in samples. Default: 0.5s => 50@100Hz or 250@500Hz.")
     parser.add_argument("--stride", type=int, default=None,
-                        help="Stride in samples. Default: window//2 (50% overlap).")
+                        help="Patch stride. Default: window//2.")
+    parser.add_argument("--token_dim", type=int, default=64)
+    parser.add_argument("--hyper_hidden", type=int, default=256)
 
-    # Misc
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--num_workers", type=int, default=2)
     parser.add_argument("--accelerator", type=str, default="auto")
     parser.add_argument("--devices", type=int, default=1)
 
-    # WandB
-    parser.add_argument("--wandb_project", type=str, default="mesormorphic_ecg", help="WandB project name")
-    parser.add_argument("--wandb_name", type=str, default=None, help="WandB run name (default: timestamp)")
-    parser.add_argument("--wandb_offline", action="store_true", help="Run WandB in offline mode")
+    parser.add_argument("--wandb_project", type=str, default="mesormorphic_ecg")
+    parser.add_argument("--wandb_name", type=str, default=None)
+    parser.add_argument("--wandb_offline", action="store_true")
 
-    # Learning Rate Scheduler
     parser.add_argument("--scheduler", type=str, default="cosine",
-                        choices=["cosine", "step", "reduce_on_plateau", "cosine_restarts", "none"],
-                        help="Learning rate scheduler type")
-    parser.add_argument("--scheduler_params", type=str, default="{}",
-                        help="JSON string for scheduler parameters (e.g., '{\"T_0\": 10, \"T_mult\": 2}')")
+                        choices=["cosine", "step", "reduce_on_plateau", "cosine_restarts", "none"])
+    parser.add_argument("--scheduler_params", type=str, default="{}")
 
-    # Early Stopping
-    parser.add_argument("--early_stop_patience", type=int, default=10,
-                        help="Early stopping patience (epochs)")
-    parser.add_argument("--early_stop_min_delta", type=float, default=0.0,
-                        help="Minimum change to qualify as improvement")
+    parser.add_argument("--early_stop_patience", type=int, default=10)
+    parser.add_argument("--early_stop_min_delta", type=float, default=0.0)
     parser.add_argument("--early_stop_monitor", type=str, default="val_auc",
-                        choices=["val_loss", "val_auc", "val_acc"],
-                        help="Metric to monitor for early stopping")
-    parser.add_argument("--early_stop_mode", type=str, default="max",
-                        choices=["min", "max"],
-                        help="Whether to minimize or maximize the monitored metric")
+                        choices=["val_loss", "val_auc", "val_acc"])
+    parser.add_argument("--early_stop_mode", type=str, default="max", choices=["min", "max"])
 
-    # Output
-    parser.add_argument("--out_dir", type=str, default="runs/mi_vs_norm_baseline_2d_gradcam", help="Base output directory")
-
-    # Visualization
-    parser.add_argument("--viz_pdf", type=str, default="viz_mi_vs_norm_test_gradcam.pdf")
+    parser.add_argument("--out_dir", type=str, default="runs/imn1d_lead_segment", help="Base output directory")
+    parser.add_argument("--viz_pdf", type=str, default="viz_norm_vs_mi_imn1d.pdf")
     parser.add_argument("--n_pos_viz", type=int, default=25)
     parser.add_argument("--n_neg_viz", type=int, default=25)
     parser.add_argument("--viz_random", action="store_true")
@@ -594,64 +572,57 @@ def main():
 
     set_seed(args.seed)
 
-    # Parse scheduler params
     try:
         scheduler_params = json.loads(args.scheduler_params)
     except json.JSONDecodeError:
         scheduler_params = {}
+
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print("Device:", device)
 
-    # Timestamped run dir (include task for organization)
     timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
     run_dir = os.path.join(args.out_dir, args.task, timestamp)
     os.makedirs(run_dir, exist_ok=True)
-    print(f"📁 Run directory: {run_dir}")
+    print(f"Run directory: {run_dir}")
 
     with open(os.path.join(run_dir, "args.yaml"), "w") as f:
         yaml.safe_dump(vars(args), f)
 
     path = args.path if args.path.endswith("/") else args.path + "/"
 
-    # Load metadata
     Y = pd.read_csv(path + "ptbxl_database.csv", index_col="ecg_id")
     Y.scp_codes = Y.scp_codes.apply(lambda x: ast.literal_eval(x))
     _, aggregate_diagnostic = build_superclasses(path)
     Y["diagnostic_superclass"] = Y.scp_codes.apply(aggregate_diagnostic)
 
-    # Binary task: NORM vs pos_class (exclusive)
     TASK_TO_POS = {"norm_vs_mi": "MI", "norm_vs_sttc": "STTC", "norm_vs_cd": "CD", "norm_vs_hyp": "HYP"}
     pos_class = TASK_TO_POS[args.task]
 
     labels = Y["diagnostic_superclass"].values
     is_pos = np.array([pos_class in l for l in labels])
     is_norm = np.array(["NORM" in l for l in labels])
-    keep = (is_pos ^ is_norm)
+    keep = is_pos ^ is_norm
     Yf = Y[keep].copy()
 
     y_bin = np.array([1 if pos_class in l else 0 for l in Yf["diagnostic_superclass"].values], dtype=np.int64)
-    print(f"Task {args.task}: N={len(Yf)} | {pos_class}={int(y_bin.sum())} | NORM={int((1-y_bin).sum())}")
+    print(f"Task {args.task}: N={len(Yf)} | {pos_class}={int(y_bin.sum())} | NORM={int((1 - y_bin).sum())}")
 
-    # Load signals
-    print(f"Loading signals at {args.sampling_rate}Hz ...")
-    X = load_raw_data(Yf, args.sampling_rate, path)  # [N,L,12]
-    X = np.transpose(X, (0, 2, 1))                   # [N,12,L]
+    print("Loading signals ...")
+    X = load_raw_data(Yf, args.sampling_rate, path)
+    X = np.transpose(X, (0, 2, 1))  # [N, 12, L]
     N, C, Lsig = X.shape
     print("X shape:", X.shape)
 
-    # Folds: train 1-8, validation 9+10 (combined)
     fold = Yf["strat_fold"].values
     train_mask = (fold >= 1) & (fold <= 8)
-    val_mask = (fold >= 9)
+    val_mask = fold >= 9
 
     X_train, y_train = X[train_mask], y_bin[train_mask]
-    X_val, y_val     = X[val_mask], y_bin[val_mask]
-
+    X_val, y_val = X[val_mask], y_bin[val_mask]
     print("Split sizes: train=", len(y_train), ", val=", len(y_val))
 
-    # Default window/stride for visualization segments
     if args.window is None:
-        window = 50 if args.sampling_rate == 100 else 250  # 0.5s
+        window = 50 if args.sampling_rate == 100 else 250
     else:
         window = args.window
     if args.stride is None:
@@ -659,35 +630,41 @@ def main():
     else:
         stride = args.stride
 
-    assert window <= Lsig
-    assert stride > 0
+    assert window <= Lsig and stride > 0
     Tseg = (Lsig - window) // stride + 1
-    print(f"Visualization segments: window={window}, stride={stride}, T={Tseg}")
+    P = 12 * Tseg
+    print(f"IMN 1D patches: window={window}, stride={stride}, T={Tseg}, P=12*T={P} (lead×segment)")
 
-    # Torch tensors
     X_train_t = torch.from_numpy(X_train).float()
     y_train_t = torch.from_numpy(y_train).long()
-    X_val_t   = torch.from_numpy(X_val).float()
-    y_val_t   = torch.from_numpy(y_val).long()
+    X_val_t = torch.from_numpy(X_val).float()
+    y_val_t = torch.from_numpy(y_val).long()
 
-    # Class weights (inverse frequency) for CE
     n_pos = float((y_train_t == 1).sum())
     n_neg = float((y_train_t == 0).sum())
     w0 = (n_pos + n_neg) / max(n_neg, 1.0)
     w1 = (n_pos + n_neg) / max(n_pos, 1.0)
     class_weights = [float(w0), float(w1)]
-    print(f"Class weights CE: w0={w0:.3f}, w1={w1:.3f}")
+    print(f"Class weights: w0={w0:.3f}, w1={w1:.3f}")
 
     train_ds = PTBXLBinaryDatasetCE(X_train_t, y_train_t, per_lead_zscore=True)
-    val_ds   = PTBXLBinaryDatasetCE(X_val_t, y_val_t, per_lead_zscore=True)
+    val_ds = PTBXLBinaryDatasetCE(X_val_t, y_val_t, per_lead_zscore=True)
 
-    train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True,
-                              num_workers=args.num_workers, pin_memory=(device == "cuda"))
-    val_loader   = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False,
-                              num_workers=args.num_workers, pin_memory=(device == "cuda"))
+    train_loader = DataLoader(
+        train_ds, batch_size=args.batch_size, shuffle=True,
+        num_workers=args.num_workers, pin_memory=(device == "cuda")
+    )
+    val_loader = DataLoader(
+        val_ds, batch_size=args.batch_size, shuffle=False,
+        num_workers=args.num_workers, pin_memory=(device == "cuda")
+    )
 
-    # Lightning model (wraps ECGConv2DBaseline)
-    lit = Conv2DBaselineLightning(
+    lit = IMN1DLightning(
+        signal_len=Lsig,
+        window=window,
+        stride=stride,
+        token_dim=args.token_dim,
+        hyper_hidden=args.hyper_hidden,
         dropout=args.dropout,
         lr=args.lr,
         weight_decay=args.weight_decay,
@@ -696,7 +673,6 @@ def main():
         scheduler_params=scheduler_params,
     )
 
-    # WandB logger
     wandb_name = args.wandb_name or timestamp
     wandb_logger = WandbLogger(
         project=args.wandb_project,
@@ -705,9 +681,8 @@ def main():
         offline=args.wandb_offline,
     )
     wandb_logger.log_hyperparams(vars(args))
-    wandb_logger.log_hyperparams({"window": window, "stride": stride, "signal_len": Lsig, "task": args.task, "pos_class": pos_class})
+    wandb_logger.log_hyperparams({"window": window, "stride": stride, "signal_len": Lsig, "task": args.task, "pos_class": pos_class, "P_lead_segment": P})
 
-    # Callbacks
     ckpt_cb = ModelCheckpoint(
         dirpath=run_dir,
         filename="best-{epoch:02d}-{val_auc:.4f}",
@@ -738,24 +713,24 @@ def main():
 
     trainer.fit(lit, train_loader, val_loader)
 
-    # Test best
     best_path = ckpt_cb.best_model_path
     if best_path and os.path.exists(best_path):
         print("Loading best checkpoint:", best_path)
-        lit = Conv2DBaselineLightning.load_from_checkpoint(best_path)
-    lit = lit.to(device)
+        lit = IMN1DLightning.load_from_checkpoint(best_path)
 
     trainer.test(lit, val_loader)
 
-    # Best model validation metrics -> CSV
-    lit = lit.to(device)
+    device_obj = torch.device(device)
+    lit = lit.to(device_obj)
+    lit.model = lit.model.to(device_obj)
+
     lit.eval()
     y_true_list, y_pred_list, y_prob_list = [], [], []
     with torch.no_grad():
         for x, y in val_loader:
-            x = x.to(device)
+            x = x.to(device_obj)
             logits = lit.model(x)
-            prob = torch.softmax(logits, dim=1)[:, 1]
+            prob = F.softmax(logits, dim=1)[:, 1]
             pred = logits.argmax(dim=1)
             y_true_list.append(y.numpy())
             y_pred_list.append(pred.cpu().numpy())
@@ -777,20 +752,18 @@ def main():
     pd.DataFrame([metrics]).to_csv(metrics_csv_path, index=False)
     print(f"Validation metrics saved to: {metrics_csv_path}")
 
-    # Save model text
     with open(os.path.join(run_dir, "model.txt"), "w") as f:
         f.write(str(lit.model))
 
-    # Grad-CAM PDF
     pdf_path = args.viz_pdf
     if not os.path.isabs(pdf_path):
         pdf_path = os.path.join(run_dir, pdf_path)
 
-    print("Saving Grad-CAM PDF to:", pdf_path)
-    visualize_pos_neg_to_pdf_gradcam(
+    print("Saving IMN 1D lead×segment visualization PDF to:", pdf_path)
+    visualize_pos_neg_to_pdf_imn1d(
         model=lit.model,
         dataset=val_ds,
-        device=device,
+        device=device_obj,
         pdf_path=pdf_path,
         sampling_rate=args.sampling_rate,
         window=window,
@@ -799,11 +772,10 @@ def main():
         n_neg=args.n_neg_viz,
         pos_class_name=pos_class,
         random_pick=args.viz_random,
-        seed=args.viz_seed
+        seed=args.viz_seed,
     )
     print("Done.")
 
-    # Finish WandB run
     wandb.finish()
 
 
