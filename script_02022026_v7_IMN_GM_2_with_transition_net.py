@@ -4,8 +4,8 @@ PTB-XL MI vs NORM - Interpretable Mesomorphic Neural Network (IMN) Implementatio
 Based on: "Interpretable Mesomorphic Neural Networks" (NeurIPS 2024)
 Converted from black-box CNN + Grad-CAM baseline.
 
-- Architecture: Deep Hypernetwork (CNN) -> Generates Linear Weights for the input instance.
-- Prediction: Logits = dot(Input, Generated_Weights) + Generated_Bias
+- Architecture: Deep Hypernetwork (CNN + Transition Decoder) -> Generates Weights W and Bias b.
+- Prediction: Logits = sum(Input * Generated_Weights) + Generated_Bias
 - Loss: CrossEntropy + Lambda * L1_Norm(Generated_Weights)
 - XAI: Intrinsic. We visualize the generated weights * input (Feature Attribution).
 
@@ -115,93 +115,115 @@ class PTBXLBinaryDatasetCE(Dataset):
 
 
 # -----------------------
-# IMN Architecture
+# IMN Architecture (Updated with Transition Network)
 # -----------------------
 class ECG_IMN(nn.Module):
     """
-    Interpretable Mesomorphic Network for ECG.
+    Interpretable Mesomorphic Network for ECG with Transition Network.
     
-    Hypernetwork: A 2D CNN that processes the signal.
-    Output: Instead of logits, it outputs Weights W and Bias b.
-    Final Prediction: y = x^T * W + b
+    Hypernetwork: A 2D CNN (Backbone) + Convolutional Decoder (Transition).
+    Output: Generates Weights W [B, Num_Classes, 12, L] and Bias b [B, Num_Classes].
+    Final Prediction: y = sum(W * x) + b
     
-    This enforces that the decision boundary is locally linear (per instance),
-    making W directly interpretable as feature importance.
+    The Transition Network gradually constructs the weights from the latent space,
+    preserving local structure and significantly reducing parameter count compared 
+    to a dense projection.
     """
     def __init__(self, input_channels=12, signal_len=1000, num_classes=2, dropout=0.2):
         super().__init__()
-        self.input_dim = input_channels * signal_len
         self.num_classes = num_classes
         self.C = input_channels
         self.L = signal_len
 
-        # --- Hypernetwork Backbone (CNN feature extractor) ---
+        # --- Hypernetwork Backbone (Encoder) ---
+        # Input: [B, 1, 12, L]
         self.conv1 = nn.Sequential(
             nn.Conv2d(1, 16, kernel_size=(3, 15), padding=(1, 7), bias=False),
             nn.BatchNorm2d(16),
             nn.GELU(),
-        )
+        ) # Out: [B, 16, 12, L]
+
         self.conv2 = nn.Sequential(
             nn.Conv2d(16, 32, kernel_size=(3, 15), padding=(1, 7), bias=False),
             nn.BatchNorm2d(32),
             nn.GELU(),
             nn.MaxPool2d(kernel_size=(1, 2)), 
-        )
+        ) # Out: [B, 32, 12, L/2]
+
         self.conv3 = nn.Sequential(
             nn.Conv2d(32, 64, kernel_size=(3, 15), padding=(1, 7), bias=False),
             nn.BatchNorm2d(64),
             nn.GELU(),
             nn.MaxPool2d(kernel_size=(1, 2)),
-        )
+        ) # Out: [B, 64, 12, L/4]
+        
         self.dropout = nn.Dropout(dropout)
 
-        # --- Hypernetwork Head (Generates W and b) ---
-        # Input: 64 (from global average pooling of CNN backbone)
-        # Output: num_classes * (input_dim + 1) -> Weights + Bias for every feature per class
-        # Note: This layer can be very large. 
-        # For 500Hz (L=2500): 12*2500 = 30k inputs. Output ~ 60k parameters.
-        self.hyper_head = nn.Linear(64, num_classes * (self.input_dim + 1))
+        # --- Transition Network (Weight Generator) ---
+        # Gradually upsamples features to generate element-wise weights W.
+        # Input: [B, 64, 12, L/4] -> Output: [B, num_classes, 12, L]
+        self.transition = nn.Sequential(
+            # Stage 1: Upsample L/4 -> L/2, Reduce Channels 64 -> 32
+            nn.Conv2d(64, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            nn.Upsample(scale_factor=(1, 2), mode='nearest'), 
+            
+            # Stage 2: Upsample L/2 -> L, Reduce Channels 32 -> 16
+            nn.Conv2d(32, 16, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.GELU(),
+            nn.Upsample(scale_factor=(1, 2), mode='nearest'),
+
+            # Final Projection: Map to num_classes (Weights W)
+            # No activation (weights can be positive or negative)
+            nn.Conv2d(16, num_classes, kernel_size=3, padding=1, bias=True) 
+        )
+
+        # --- Bias Generator ---
+        # Scalar bias b is still best generated from global context
+        self.bias_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.bias_head = nn.Linear(64, num_classes)
 
     def forward(self, x):
         """
         x: [B, 12, L]
         """
-        B = x.shape[0]
+        B, C, L = x.shape
         
-        # 1. Extract Features via Hypernetwork
+        # 1. Extract Features via Backbone
         # Input to CNN needs [B, 1, 12, L]
         feat = x.unsqueeze(1)
         feat = self.conv1(feat)
         feat = self.conv2(feat)
         feat = self.conv3(feat)       # [B, 64, 12, L/4]
-        
-        # Global Average Pooling
-        feat = feat.mean(dim=(2, 3))  # [B, 64]
         feat = self.dropout(feat)
 
-        # 2. Generate Linear Model Parameters (Weights & Biases)
-        # params: [B, num_classes * (M + 1)]
-        params = self.hyper_head(feat)
+        # 2. Generate Linear Model Parameters
         
-        # Reshape to [B, num_classes, M + 1]
-        params = params.view(B, self.num_classes, self.input_dim + 1)
+        # A) Generate Weights W using Transition Network
+        # Output: [B, num_classes, 12, L]
+        generated_w = self.transition(feat)
         
-        # Split into Weights W [B, C, M] and Bias b [B, C, 1]
-        generated_w = params[:, :, :-1]
-        generated_b = params[:, :, -1]
+        # B) Generate Bias b using Global Pool
+        # [B, 64, 1, 1] -> [B, 64] -> [B, num_classes]
+        b_feat = self.bias_pool(feat).view(B, -1)
+        generated_b = self.bias_head(b_feat)
 
         # 3. Apply Local Linear Model
-        # Flatten input x: [B, 12, L] -> [B, M]
-        x_flat = x.reshape(B, -1)
+        # Equation: Logits_k = Sum(W_k * x) + b_k
         
-        # Logits = (W * x) + b
-        # Perform batched dot product
-        # x_flat.unsqueeze(1): [B, 1, M]
-        # generated_w: [B, C, M]
-        # product: [B, C, M] -> sum over M -> [B, C]
-        logits = (generated_w * x_flat.unsqueeze(1)).sum(dim=2) + generated_b
+        # Prepare x for broadcasting: [B, 1, 12, L]
+        x_expanded = x.unsqueeze(1)
+        
+        # Element-wise multiplication: [B, num_classes, 12, L]
+        weighted_input = generated_w * x_expanded
+        
+        # Sum over feature dimensions (12 leads, L time steps)
+        # Result: [B, num_classes]
+        logits = weighted_input.sum(dim=(2, 3)) + generated_b
 
-        return logits, generated_w, generated_b
+        return logits, generated_w, generated_b.unsqueeze(-1)
 
 
 # -----------------------
@@ -401,10 +423,14 @@ def visualize_imn_to_pdf(model, dataset, device, pdf_path: str,
                          n_pos: int, n_neg: int,
                          pos_class_name: str = "MI",
                          random_pick: bool = False, seed: int = 123,
-                         lead_names=None, lambda_l1: float = 1e-4):
+                         lead_names=None, lambda_l1: float = 1e-4,
+                         viz_negative_class: bool = False):
     """
     Visualizes IMN Feature Attributions.
     Calculation: Impact = w(x) * x
+
+    When viz_negative_class=True: for NORM samples, use class 0 weights (evidence for NORM)
+    instead of class 1 weights. Uses Blues colormap for negative class vs Reds for positive.
     """
     model.eval()
     if lead_names is None:
@@ -433,29 +459,38 @@ def visualize_imn_to_pdf(model, dataset, device, pdf_path: str,
     with PdfPages(pdf_path) as pdf:
         for tag, idx in selected:
             x, y = dataset[idx]               # x: [12, L]
+            y_int = int(y.item())
             x_b = x.unsqueeze(0).to(device)   # [1, 12, L]
             
             with torch.no_grad():
                 # Forward IMN
                 logits, gen_w, gen_b = model(x_b)
-                prob = float(torch.softmax(logits, dim=1)[0, 1].item())
+                prob_pos = float(torch.softmax(logits, dim=1)[0, 1].item())
+                prob_neg = float(torch.softmax(logits, dim=1)[0, 0].item())
                 
-                # gen_w shape: [1, 2, M], where M = 12 * L
-                # We want the weights for Class 1 (Positive/MI)
-                # Reshape back to [12, L]
-                w_pos = gen_w[0, 1, :].view(12, -1).cpu().numpy()
+                # gen_w shape: [1, num_classes, 12, L]
+                # For positive samples or when viz_negative_class=False: use class 1 (positive) weights
+                # For negative samples when viz_negative_class=True: use class 0 (negative) weights
+                use_neg_class = viz_negative_class and (y_int == 0)
+                class_idx = 0 if use_neg_class else 1
+                w_used = gen_w[0, class_idx, :, :].cpu().numpy()  # [12, L]
                 
             x_np = x.numpy()
             
             # --- Feature Attribution Strategy ---
             # Paper Eq (2): Impact = w * x
             # This shows the contribution of the feature to the specific prediction.
-            impact = w_pos * x_np
+            impact = w_used * x_np
             
             # Create segment heatmap for visualization overview
             seg_hm = imn_weights_to_segments(impact, window=window, stride=stride)
             Tseg = seg_hm.shape[1]
             Lsig = x.shape[1]
+
+            # Colormap and shading: Reds for positive class, Blues for negative class
+            cmap = "Blues" if use_neg_class else "Reds"
+            shade_color = "blue" if use_neg_class else "red"
+            weight_label = "NORM" if use_neg_class else pos_class_name
 
             # Plotting
             fig = plt.figure(figsize=(11.7, 16.5))
@@ -463,11 +498,12 @@ def visualize_imn_to_pdf(model, dataset, device, pdf_path: str,
 
             # Heatmap Top
             ax0 = fig.add_subplot(gs[0, 0])
-            im = ax0.imshow(seg_hm, aspect="auto", vmin=0, vmax=1, cmap="Reds")
+            im = ax0.imshow(seg_hm, aspect="auto", vmin=0, vmax=1, cmap=cmap)
             ax0.set_yticks(range(12))
             ax0.set_yticklabels(lead_names)
             ax0.set_xlabel(f"Segments (window={window}, stride={stride}, fs={sampling_rate}Hz)")
-            ax0.set_title(f"IMN Intrinsic Explanation | {tag} | True={int(y.item())} | P({pos_class_name})={prob:.3f} | idx={idx}")
+            prob_str = f"P({pos_class_name})={prob_pos:.3f}" if not use_neg_class else f"P(NORM)={prob_neg:.3f}"
+            ax0.set_title(f"IMN Intrinsic Explanation | {tag} | True={y_int} | {prob_str} | Weights={weight_label} | idx={idx}")
             fig.colorbar(im, ax=ax0, fraction=0.02, pad=0.01)
 
             # Signal traces with shading
@@ -486,16 +522,17 @@ def visualize_imn_to_pdf(model, dataset, device, pdf_path: str,
                     if alpha > 0.05:
                         start = t * stride
                         end = min(start + window, Lsig)
-                        ax.axvspan(start, end, alpha=alpha, color="red", linewidth=0)
+                        ax.axvspan(start, end, alpha=alpha, color=shade_color, linewidth=0)
                 
                 ax.set_xticks([])
 
             # Footer
             axf = fig.add_subplot(gs[13, 0])
             axf.axis("off")
-            axf.text(0, 0.5, 
-                     f"IMN Feature Attribution: $|w(x) \cdot x|$ aggregated by segment. L1 Reg={lambda_l1}", 
-                     fontsize=10)
+            footer_text = f"IMN Feature Attribution: $|w(x) \cdot x|$ aggregated by segment. L1 Reg={lambda_l1}"
+            if use_neg_class:
+                footer_text += " | Showing NORM (class 0) weights."
+            axf.text(0, 0.5, footer_text, fontsize=10)
 
             fig.tight_layout()
             pdf.savefig(fig)
@@ -515,7 +552,7 @@ def main():
     # Training
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch_size", type=int, default=64)
-    parser.add_argument("--lr", type=float, default=1e-2)
+    parser.add_argument("--lr", type=float, default=1e-3)
     parser.add_argument("--weight_decay", type=float, default=1e-4)
     parser.add_argument("--dropout", type=float, default=0.2)
     
@@ -571,6 +608,8 @@ def main():
     parser.add_argument("--n_pos_viz", type=int, default=25)
     parser.add_argument("--n_neg_viz", type=int, default=25)
     parser.add_argument("--viz_random", action="store_true")
+    parser.add_argument("--viz_negative_class", action="store_true",
+                        help="For NORM samples, visualize class 0 (NORM) weights instead of class 1 (positive) weights.")
 
     args = parser.parse_args()
 
@@ -778,7 +817,8 @@ def main():
             pos_class_name=pos_class,
             random_pick=args.viz_random,
             seed=123,
-            lambda_l1=args.lambda_l1
+            lambda_l1=args.lambda_l1,
+            viz_negative_class=args.viz_negative_class
         )
     print("Done.")
 

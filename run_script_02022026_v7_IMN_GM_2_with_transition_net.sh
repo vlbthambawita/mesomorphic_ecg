@@ -4,19 +4,19 @@ set -e
 # Use GPU 0
 export CUDA_VISIBLE_DEVICES=0
 
-# PTB-XL NORM vs X - Interpretable Mesomorphic Neural Network (IMN)
+# PTB-XL NORM vs X - Interpretable Mesomorphic Neural Network (IMN) with Transition Network
 # Runs all task types: norm_vs_mi, norm_vs_sttc, norm_vs_cd, norm_vs_hyp.
 # For quick test use --epochs 1.
 
 TASKS=(norm_vs_mi norm_vs_sttc norm_vs_cd norm_vs_hyp)
-BASE_OUT=runs/imn_ecg_simple_implementation_GM_Basic
+BASE_OUT=runs/imn_ecg_transition_net_GM_100Hz
 
 for task in "${TASKS[@]}"; do
   echo "========== Running task: $task =========="
-  python script_02022026_v7_IMN_GM_1.py \
+  python script_02022026_v7_IMN_GM_2_with_transition_net.py \
     --path /work/vajira/DATA/EXG_PTB_XL/physionet/files/ptb-xl/1_0_1 \
     --task "$task" \
-    --sampling_rate 500 \
+    --sampling_rate 100 \
     --epochs 100 \
     --batch_size 64 \
     --lambda_l1 1e-4 \

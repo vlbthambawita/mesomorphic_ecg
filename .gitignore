@@ -1,6 +1,9 @@
 # Checkpoints
 checkpoints/
 
+#lightning logs
+lightning_logs/
+
 # Training runs
 runs/
 

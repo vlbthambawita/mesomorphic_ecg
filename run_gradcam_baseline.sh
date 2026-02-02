@@ -6,7 +6,7 @@ set -e
 # For quick test use --epochs 1.
 
 TASKS=(norm_vs_mi norm_vs_sttc norm_vs_cd norm_vs_hyp)
-BASE_OUT=runs/baseline_2d_gradcam
+BASE_OUT=runs/baseline_2d_gradcam_100Hz
 
 for task in "${TASKS[@]}"; do
   echo "========== Running task: $task =========="
@@ -14,7 +14,7 @@ for task in "${TASKS[@]}"; do
     --path /work/vajira/DATA/EXG_PTB_XL/physionet/files/ptb-xl/1_0_1 \
     --task "$task" \
     --batch_size 64 \
-    --sampling_rate 500 \
+    --sampling_rate 100 \
     --epochs 100 \
     --n_pos_viz 10 \
     --n_neg_viz 10 \
