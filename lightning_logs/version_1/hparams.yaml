@@ -1,0 +1,11 @@
+input_channels: 12
+signal_len: 5000
+dropout: 0.2
+lr: 0.001
+weight_decay: 0.0001
+lambda_l1: 0.0001
+class_weights:
+- 1.5497824080179348
+- 2.818901415207484
+scheduler_type: step
+scheduler_params: {}
