@@ -147,18 +147,27 @@ def build_fig_imn_single(
     removed_leads: Optional[list[int]] = None,
     removed_segments: Optional[list[tuple[int, int]]] = None,
     prob_abl: Optional[float] = None,
+    lead_imp_signed: Optional[np.ndarray] = None,
 ) -> plt.Figure:
     """
     Build a matplotlib figure for IMN single-linear feature attribution visualization.
     seg_hm: [12, T] segment heatmap from imn_weights_to_segments (normalized magnitudes).
+    lead_imp_signed: [12] signed contribution per lead (impact.sum(axis=1)); used for
+        percentages so they match the top-leads ranking (by signed contribution).
     """
     import matplotlib.patches as mpatches
 
     L = x_np.shape[1]
 
-    # Per-lead contribution share (magnitude)
-    lead_abs = np.abs(seg_hm).sum(axis=1)
-    lead_pct = 100.0 * lead_abs / (lead_abs.sum() + 1e-9)
+    # Per-lead contribution share: use signed contribution so percentages match top leads.
+    # Use sum of |lead_imp_signed| as denominator so ranking is preserved when total < 0
+    # (e.g. NORM prediction); otherwise negative total would invert the percentages.
+    if lead_imp_signed is not None:
+        denom = np.abs(lead_imp_signed).sum() + 1e-9
+        lead_pct = 100.0 * lead_imp_signed / denom
+    else:
+        lead_abs = np.abs(seg_hm).sum(axis=1)
+        lead_pct = 100.0 * lead_abs / (lead_abs.sum() + 1e-9)
 
     cmap = "Reds"
     shade_color = "red"
@@ -278,7 +287,7 @@ def build_fig_imn_single(
     )
     if rem_lead_set or rem_seg_set:
         leg += "Red boxes = removed (ablation)."
-    axf.text(0, 0.5, leg, fontsize=9)
+    axf.text(0.5, 0.5, leg, fontsize=9, wrap=True, transform=axf.transAxes, ha="center", va="center")
 
     fig.tight_layout()
     return fig
@@ -524,6 +533,7 @@ def predict_imn_single(
         removed_leads=removed_leads or None,
         removed_segments=removed_segments or None,
         prob_abl=prob_abl,
+        lead_imp_signed=lead_imp_signed,
     )
 
     tl = ", ".join(LEAD_NAMES[i] for i in top_leads) if top_leads else "—"
