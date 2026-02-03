@@ -1,0 +1,794 @@
+"""
+PTB-XL MI vs NORM - Interpretable Mesomorphic Neural Network (IMN) Implementation.
+SINGLE LINEAR OUTPUT VERSION (Binary Classification with 1 Output Node).
+
+Based on: "Interpretable Mesomorphic Neural Networks" (NeurIPS 2024)
+Converted from black-box CNN + Grad-CAM baseline.
+
+- Architecture: Deep Hypernetwork (CNN + Transition Decoder) -> Generates Weights W and Bias b.
+- Prediction: Logit = sum(Input * Generated_Weights) + Generated_Bias (Shape: [B, 1])
+- Loss: BinaryCrossEntropyWithLogits + Lambda * L1_Norm(Generated_Weights)
+- XAI: Intrinsic. We visualize the generated weights * input.
+
+Run:
+python imn_ptbxl_1d.py --path /path/to/ptbxl --sampling_rate 500 --epochs 20 --lambda_l1 1e-4 --viz_random
+"""
+
+import argparse
+import ast
+import json
+import os
+import random
+import numpy as np
+import pandas as pd
+import wfdb
+from datetime import datetime
+import yaml
+
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from torch.utils.data import Dataset, DataLoader
+
+import matplotlib.pyplot as plt
+from matplotlib.backends.backend_pdf import PdfPages
+import matplotlib.colors as mcolors
+
+import pytorch_lightning as pl
+from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, LearningRateMonitor
+from pytorch_lightning.loggers.wandb import WandbLogger
+from sklearn.metrics import (
+    accuracy_score,
+    balanced_accuracy_score,
+    precision_score,
+    recall_score,
+    f1_score,
+    matthews_corrcoef,
+    roc_auc_score,
+)
+
+# -----------------------
+# Reproducibility
+# -----------------------
+def set_seed(seed: int = 42):
+    random.seed(seed)
+    np.random.seed(seed)
+    torch.manual_seed(seed)
+    torch.cuda.manual_seed_all(seed)
+    torch.backends.cudnn.deterministic = True
+    torch.backends.cudnn.benchmark = False
+
+
+# -----------------------
+# PTB-XL official loading
+# -----------------------
+def load_raw_data(df: pd.DataFrame, sampling_rate: int, path: str) -> np.ndarray:
+    if sampling_rate == 100:
+        data = [wfdb.rdsamp(path + f) for f in df.filename_lr]
+    else:
+        data = [wfdb.rdsamp(path + f) for f in df.filename_hr]
+    data = np.array([signal for signal, meta in data])  # [N, L, 12]
+    return data
+
+
+def build_superclasses(path: str):
+    agg_df = pd.read_csv(path + 'scp_statements.csv', index_col=0)
+    agg_df = agg_df[agg_df.diagnostic == 1]
+
+    def aggregate_diagnostic(y_dic):
+        tmp = []
+        for key in y_dic.keys():
+            if key in agg_df.index:
+                tmp.append(agg_df.loc[key].diagnostic_class)
+        return list(set(tmp))
+
+    return agg_df, aggregate_diagnostic
+
+
+# -----------------------
+# Dataset
+# -----------------------
+class PTBXLBinaryDataset(Dataset):
+    """
+    X: [N, 12, L]
+    y: [N] int64 {0,1}   0=NORM, 1=MI
+    """
+    def __init__(self, X: torch.Tensor, y: torch.Tensor, per_lead_zscore: bool = True):
+        super().__init__()
+        assert X.ndim == 3 and X.shape[1] == 12
+        self.X = X.float()
+        self.y = y.float() # Changed to float for BCE
+        self.per_lead_zscore = per_lead_zscore
+
+    def __len__(self):
+        return self.X.shape[0]
+
+    def __getitem__(self, idx):
+        x = self.X[idx]  # [12, L]
+        y = self.y[idx]  # scalar float
+
+        if self.per_lead_zscore:
+            mean = x.mean(dim=1, keepdim=True)
+            std = x.std(dim=1, keepdim=True).clamp_min(1e-6)
+            x = (x - mean) / std
+
+        return x, y
+
+
+# -----------------------
+# IMN Architecture (Single Linear Output)
+# -----------------------
+class ECG_IMN(nn.Module):
+    """
+    Interpretable Mesomorphic Network for ECG.
+    
+    Generates ONE set of Weights W [B, 1, 12, L] and ONE Bias b [B, 1].
+    Final Prediction: Logit = sum(W * x) + b
+    
+    Sigmoid(Logit) -> Probability of Positive Class.
+    """
+    def __init__(self, input_channels=12, signal_len=1000, dropout=0.2):
+        super().__init__()
+        self.C = input_channels
+        self.L = signal_len
+        
+        # We output 1 feature map for the binary decision boundary
+        output_dim = 1 
+
+        # --- Hypernetwork Backbone (Encoder) ---
+        # Input: [B, 1, 12, L]
+        self.conv1 = nn.Sequential(
+            nn.Conv2d(1, 16, kernel_size=(3, 15), padding=(1, 7), bias=False),
+            nn.BatchNorm2d(16),
+            nn.GELU(),
+        ) # Out: [B, 16, 12, L]
+
+        self.conv2 = nn.Sequential(
+            nn.Conv2d(16, 32, kernel_size=(3, 15), padding=(1, 7), bias=False),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            nn.MaxPool2d(kernel_size=(1, 2)), 
+        ) # Out: [B, 32, 12, L/2]
+
+        self.conv3 = nn.Sequential(
+            nn.Conv2d(32, 64, kernel_size=(3, 15), padding=(1, 7), bias=False),
+            nn.BatchNorm2d(64),
+            nn.GELU(),
+            nn.MaxPool2d(kernel_size=(1, 2)),
+        ) # Out: [B, 64, 12, L/4]
+        
+        self.dropout = nn.Dropout(dropout)
+
+        # --- Transition Network (Weight Generator) ---
+        # Input: [B, 64, 12, L/4] -> Output: [B, 1, 12, L]
+        self.transition = nn.Sequential(
+            # Stage 1: Upsample L/4 -> L/2
+            nn.Conv2d(64, 32, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(32),
+            nn.GELU(),
+            nn.Upsample(scale_factor=(1, 2), mode='nearest'), 
+            
+            # Stage 2: Upsample L/2 -> L
+            nn.Conv2d(32, 16, kernel_size=3, padding=1, bias=False),
+            nn.BatchNorm2d(16),
+            nn.GELU(),
+            nn.Upsample(scale_factor=(1, 2), mode='nearest'),
+
+            # Final Projection: Map to 1 channel (Weight W)
+            nn.Conv2d(16, output_dim, kernel_size=3, padding=1, bias=True) 
+        )
+
+        # --- Bias Generator ---
+        # Generates scalar bias b
+        self.bias_pool = nn.AdaptiveAvgPool2d((1, 1))
+        self.bias_head = nn.Linear(64, output_dim)
+
+    def forward(self, x):
+        """
+        x: [B, 12, L]
+        Returns: logits [B, 1], generated_w [B, 1, 12, L], generated_b [B, 1]
+        """
+        B, C, L = x.shape
+        
+        # 1. Extract Features
+        feat = x.unsqueeze(1)
+        feat = self.conv1(feat)
+        feat = self.conv2(feat)
+        feat = self.conv3(feat)
+        feat = self.dropout(feat)
+
+        # 2. Generate Parameters
+        # A) Weights W: [B, 1, 12, L]
+        generated_w = self.transition(feat)
+        
+        # B) Bias b: [B, 1]
+        b_feat = self.bias_pool(feat).view(B, -1)
+        generated_b = self.bias_head(b_feat)
+
+        # 3. Apply Single Linear Model
+        # Logit = Sum(W * x) + b
+        
+        x_expanded = x.unsqueeze(1) # [B, 1, 12, L]
+        
+        # Element-wise multiplication
+        weighted_input = generated_w * x_expanded
+        
+        # Sum over features -> [B, 1]
+        logits = weighted_input.sum(dim=(2, 3)) + generated_b
+
+        return logits, generated_w, generated_b.unsqueeze(-1)
+
+
+# -----------------------
+# Lightning Module
+# -----------------------
+class IMNLightning(pl.LightningModule):
+    def __init__(
+        self,
+        input_channels: int,
+        signal_len: int,
+        dropout: float = 0.2,
+        lr: float = 1e-3,
+        weight_decay: float = 1e-4,
+        lambda_l1: float = 1e-4,
+        pos_weight: float | None = None, # Scalar weight for BCE
+        scheduler_type: str | None = "cosine",
+        scheduler_params: dict | None = None,
+    ):
+        super().__init__()
+        self.save_hyperparameters()
+
+        self.model = ECG_IMN(
+            input_channels=input_channels,
+            signal_len=signal_len,
+            dropout=dropout
+        )
+
+        self.lr = lr
+        self.weight_decay = weight_decay
+        self.lambda_l1 = lambda_l1
+        self.pos_weight_val = pos_weight
+        
+        self.scheduler_type = scheduler_type
+        self.scheduler_params = scheduler_params or {}
+        
+        self.val_probs = []
+        self.val_y = []
+
+    def configure_optimizers(self):
+        optimizer = torch.optim.AdamW(
+            self.parameters(),
+            lr=self.lr,
+            weight_decay=self.weight_decay
+        )
+
+        if self.scheduler_type is None or self.scheduler_type == "none":
+            return optimizer
+
+        if self.scheduler_type == "cosine":
+            max_epochs = getattr(self.trainer, "max_epochs", None) or 100
+            scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(
+                optimizer,
+                T_max=max_epochs,
+                **self.scheduler_params
+            )
+        elif self.scheduler_type == "step":
+            scheduler = torch.optim.lr_scheduler.StepLR(
+                optimizer,
+                step_size=self.scheduler_params.get("step_size", 10),
+                gamma=self.scheduler_params.get("gamma", 0.1),
+                **{k: v for k, v in self.scheduler_params.items() if k not in ["step_size", "gamma"]}
+            )
+        elif self.scheduler_type == "reduce_on_plateau":
+            scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
+                optimizer,
+                mode="max",
+                factor=self.scheduler_params.get("factor", 0.5),
+                patience=self.scheduler_params.get("patience", 5),
+                **{k: v for k, v in self.scheduler_params.items() if k not in ["factor", "patience"]}
+            )
+        else:
+            return optimizer
+
+        if self.scheduler_type == "reduce_on_plateau":
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": {
+                    "scheduler": scheduler,
+                    "monitor": "val_auc",
+                }
+            }
+        else:
+            return {
+                "optimizer": optimizer,
+                "lr_scheduler": scheduler,
+            }
+
+    def _get_pos_weight(self):
+        if self.pos_weight_val is None:
+            return None
+        return torch.tensor([self.pos_weight_val], device=self.device)
+
+    def training_step(self, batch, batch_idx):
+        x, y = batch # y is [B]
+        logits, gen_w, gen_b = self.model(x)
+        logits = logits.squeeze(1) # Ensure [B]
+        
+        # 1. Prediction Loss (BCE With Logits)
+        bce_loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=self._get_pos_weight())
+        
+        # 2. Interpretability Loss (L1 norm on generated weights)
+        l1_loss = gen_w.abs().mean()
+        
+        total_loss = bce_loss + (self.lambda_l1 * l1_loss)
+
+        # Metrics
+        probs = torch.sigmoid(logits)
+        preds = (probs > 0.5).float()
+        acc = (preds == y).float().mean()
+
+        self.log("train_loss", total_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("train_bce", bce_loss, on_step=False, on_epoch=True)
+        self.log("train_l1", l1_loss, on_step=False, on_epoch=True)
+        self.log("train_acc", acc, on_step=False, on_epoch=True, prog_bar=True)
+        return total_loss
+
+    def validation_step(self, batch, batch_idx):
+        x, y = batch
+        logits, gen_w, _ = self.model(x)
+        logits = logits.squeeze(1)
+        
+        bce_loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=self._get_pos_weight())
+        
+        prob = torch.sigmoid(logits)
+        pred = (prob > 0.5).float()
+        acc = (pred == y).float().mean()
+
+        self.log("val_loss", bce_loss, on_step=False, on_epoch=True, prog_bar=True)
+        self.log("val_acc", acc, on_step=False, on_epoch=True, prog_bar=True)
+
+        self.val_probs.append(prob.detach().cpu())
+        self.val_y.append(y.detach().cpu())
+
+    def on_validation_epoch_end(self):
+        y_true = torch.cat(self.val_y) if len(self.val_y) else None
+        y_score = torch.cat(self.val_probs) if len(self.val_probs) else None
+        if y_true is not None:
+            auc = simple_auc_roc(y_true, y_score)
+            self.log("val_auc", auc, on_step=False, on_epoch=True, prog_bar=True)
+        self.val_probs.clear()
+        self.val_y.clear()
+
+    def test_step(self, batch, batch_idx):
+        x, y = batch
+        logits, _, _ = self.model(x)
+        logits = logits.squeeze(1)
+        
+        bce_loss = F.binary_cross_entropy_with_logits(logits, y, pos_weight=self._get_pos_weight())
+        prob = torch.sigmoid(logits)
+        pred = (prob > 0.5).float()
+        acc = (pred == y).float().mean()
+        
+        self.log("test_loss", bce_loss, on_step=False, on_epoch=True)
+        self.log("test_acc", acc, on_step=False, on_epoch=True)
+        return {"y": y.detach().cpu(), "p": prob.detach().cpu()}
+
+
+# -----------------------
+# Metrics Helper
+# -----------------------
+@torch.no_grad()
+def simple_auc_roc(y_true: torch.Tensor, y_score: torch.Tensor) -> float:
+    y_true = y_true.detach().cpu().float()
+    y_score = y_score.detach().cpu().float()
+    if y_true.min() == y_true.max():
+        return float("nan")
+    return float(roc_auc_score(y_true.numpy(), y_score.numpy()))
+
+
+# -----------------------
+# Visualization Helpers (Intrinsic IMN)
+# -----------------------
+def imn_weights_to_segments(impact_12L: np.ndarray, window: int, stride: int) -> np.ndarray:
+    """
+    Aggregates point-wise feature attribution (Impact) into segments.
+    """
+    assert impact_12L.ndim == 2
+    L = impact_12L.shape[1]
+    T = (L - window) // stride + 1
+    seg = np.zeros((12, T), dtype=np.float32)
+    
+    for t in range(T):
+        s = t * stride
+        e = min(s + window, L)
+        seg[:, t] = np.abs(impact_12L[:, s:e]).mean(axis=1)
+        
+    mx = seg.max() + 1e-9
+    seg = seg / mx
+    return seg
+
+def visualize_imn_to_pdf(model, dataset, device, pdf_path: str,
+                         sampling_rate: int, window: int, stride: int,
+                         n_pos: int, n_neg: int,
+                         pos_class_name: str = "MI",
+                         random_pick: bool = False, seed: int = 123,
+                         lead_names=None, lambda_l1: float = 1e-4,
+                         viz_negative_class: bool = False):
+    """
+    Visualizes IMN Feature Attributions for SINGLE LINEAR OUTPUT.
+    Equation: Logit = sum(w * x) + b
+    
+    - If y=1 (MI): Positive contributions (Red) increase the logit.
+    - If y=0 (NORM): Negative contributions (Blue) decrease the logit.
+    """
+    model.eval()
+    if lead_names is None:
+        lead_names = ["I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"]
+        
+    os.makedirs(os.path.dirname(pdf_path) or ".", exist_ok=True)
+    
+    # Select indices
+    pos_idx, neg_idx = [], []
+    for i in range(len(dataset)):
+        _, y = dataset[i]
+        if int(y.item()) == 1:
+            pos_idx.append(i)
+        else:
+            neg_idx.append(i)
+
+    if random_pick:
+        rng = np.random.default_rng(seed)
+        rng.shuffle(pos_idx)
+        rng.shuffle(neg_idx)
+
+    sel_pos = pos_idx[:n_pos]
+    sel_neg = neg_idx[:n_neg]
+    selected = [(pos_class_name, i) for i in sel_pos] + [("NORM", i) for i in sel_neg]
+
+    with PdfPages(pdf_path) as pdf:
+        for tag, idx in selected:
+            x, y = dataset[idx]               # x: [12, L]
+            y_int = int(y.item())
+            x_b = x.unsqueeze(0).to(device)   # [1, 12, L]
+            
+            with torch.no_grad():
+                # Forward IMN (Single Linear Output)
+                logits, gen_w, gen_b = model(x_b)
+                prob = float(torch.sigmoid(logits)[0, 0].item())
+                
+                # gen_w is [1, 1, 12, L] -> Squeeze to [12, L]
+                w_used = gen_w[0, 0, :, :].cpu().numpy()
+                
+            x_np = x.numpy()
+            
+            # --- Feature Attribution Strategy ---
+            # Paper Eq: Impact = w * x
+            impact = w_used * x_np
+            
+            # Logic: 
+            # If visualizing MI (Pos): We care about what pushed the score UP (Positive Impact).
+            # If visualizing NORM (Neg): We care about what pushed the score DOWN (Negative Impact).
+            
+            is_norm_sample = (tag == "NORM")
+            
+            # If we strictly want to see why it was classified as NORM, we look at negative components
+            # For general magnitude importance, we can look at abs()
+            
+            # Aggregation for Heatmap (Magnitude)
+            seg_hm = imn_weights_to_segments(impact, window=window, stride=stride)
+            Tseg = seg_hm.shape[1]
+            Lsig = x.shape[1]
+
+            # Colors
+            cmap = "Blues" if is_norm_sample else "Reds"
+            shade_color = "blue" if is_norm_sample else "red"
+            
+            # Plotting
+            fig = plt.figure(figsize=(11.7, 16.5))
+            gs = fig.add_gridspec(14, 1, height_ratios=[2] + [1]*12 + [0.5])
+
+            # Heatmap Top
+            ax0 = fig.add_subplot(gs[0, 0])
+            im = ax0.imshow(seg_hm, aspect="auto", vmin=0, vmax=1, cmap=cmap)
+            ax0.set_yticks(range(12))
+            ax0.set_yticklabels(lead_names)
+            ax0.set_xlabel(f"Segments (window={window}, stride={stride}, fs={sampling_rate}Hz)")
+            
+            title_prob = f"P({pos_class_name})={prob:.3f}"
+            ax0.set_title(f"IMN Intrinsic Explanation (Single Linear) | {tag} | True={y_int} | {title_prob} | idx={idx}")
+            fig.colorbar(im, ax=ax0, fraction=0.02, pad=0.01)
+
+            # Signal traces with shading
+            for lead in range(12):
+                ax = fig.add_subplot(gs[lead + 1, 0])
+                ax.plot(x_np[lead], linewidth=0.8, color='black', alpha=0.6)
+                ax.set_xlim(0, Lsig - 1)
+                ax.set_ylabel(lead_names[lead], rotation=0, labelpad=20, va="center")
+                
+                # Shade based on importance
+                contrib = seg_hm[lead]
+                for t in range(Tseg):
+                    a = float(contrib[t])
+                    alpha = min(0.5, a * 0.6)
+                    if alpha > 0.05:
+                        start = t * stride
+                        end = min(start + window, Lsig)
+                        ax.axvspan(start, end, alpha=alpha, color=shade_color, linewidth=0)
+                
+                ax.set_xticks([])
+
+            # Footer
+            axf = fig.add_subplot(gs[13, 0])
+            axf.axis("off")
+            axf.text(0, 0.5, f"IMN Feature Attribution: $|w \cdot x|$. Single Linear Function. L1 Reg={lambda_l1}", fontsize=10)
+
+            fig.tight_layout()
+            pdf.savefig(fig)
+            plt.close(fig)
+
+
+# -----------------------
+# Main
+# -----------------------
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--path", type=str, required=True, help="path/to/ptbxl/")
+    parser.add_argument("--sampling_rate", type=int, default=500, choices=[100, 500])
+    parser.add_argument("--task", type=str, default="norm_vs_mi",
+                        choices=["norm_vs_mi", "norm_vs_sttc", "norm_vs_cd", "norm_vs_hyp"])
+
+    # Training
+    parser.add_argument("--epochs", type=int, default=20)
+    parser.add_argument("--batch_size", type=int, default=64)
+    parser.add_argument("--lr", type=float, default=1e-3)
+    parser.add_argument("--weight_decay", type=float, default=1e-4)
+    parser.add_argument("--dropout", type=float, default=0.2)
+    
+    # IMN Specific
+    parser.add_argument("--lambda_l1", type=float, default=1e-4, 
+                        help="Regularization strength for sparsity in generated weights.")
+
+    # Inference-only (skip training, load checkpoint)
+    parser.add_argument("--inference_only", action="store_true",
+                        help="Skip training; load checkpoint and run inference + viz only.")
+    parser.add_argument("--ckpt", type=str, default=None,
+                        help="Path to checkpoint. Required when --inference_only.")
+
+    # Viz
+    parser.add_argument("--window", type=int, nargs="*", default=None,
+                        help="Window size(s) for segment aggregation.")
+    parser.add_argument("--stride", type=int, nargs="*", default=None,
+                        help="Stride(s) for segment aggregation.")
+
+    # Misc
+    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--num_workers", type=int, default=2)
+    parser.add_argument("--accelerator", type=str, default="auto")
+    parser.add_argument("--devices", type=int, default=1)
+    
+    # Scheduler
+    parser.add_argument("--scheduler", type=str, default="cosine")
+    parser.add_argument("--scheduler_params", type=str, default="{}")
+
+    # Early Stopping
+    parser.add_argument("--early_stop_patience", type=int, default=10)
+    parser.add_argument("--early_stop_min_delta", type=float, default=0.0)
+    parser.add_argument("--early_stop_monitor", type=str, default="val_auc")
+    parser.add_argument("--early_stop_mode", type=str, default="max")
+
+    # Logging
+    parser.add_argument("--wandb_project", type=str, default="mesomorphic_ecg")
+    parser.add_argument("--wandb_name", type=str, default=None)
+    parser.add_argument("--wandb_offline", action="store_true")
+    
+    # Out
+    parser.add_argument("--out_dir", type=str, default="runs/imn_ecg")
+    parser.add_argument("--viz_pdf", type=str, default="imn_explanation.pdf")
+    parser.add_argument("--n_pos_viz", type=int, default=25)
+    parser.add_argument("--n_neg_viz", type=int, default=25)
+    parser.add_argument("--viz_random", action="store_true")
+    parser.add_argument("--viz_negative_class", action="store_true", help="Deprecated in single-linear mode, but kept for arg compatibility.")
+
+    args = parser.parse_args()
+
+    if args.inference_only and not args.ckpt:
+        parser.error("--ckpt is required when --inference_only")
+
+    set_seed(args.seed)
+
+    # Parse scheduler params
+    try:
+        scheduler_params = json.loads(args.scheduler_params)
+    except json.JSONDecodeError:
+        scheduler_params = {}
+
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    print("Device:", device)
+
+    timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
+    if args.inference_only:
+        run_dir = os.path.join(os.path.dirname(args.ckpt), f"inference_{timestamp}")
+    else:
+        run_dir = os.path.join(args.out_dir, args.task, timestamp)
+    os.makedirs(run_dir, exist_ok=True)
+    
+    with open(os.path.join(run_dir, "args.yaml"), "w") as f:
+        yaml.safe_dump(vars(args), f)
+
+    # Load Data
+    path = args.path if args.path.endswith("/") else args.path + "/"
+    Y = pd.read_csv(path + "ptbxl_database.csv", index_col="ecg_id")
+    Y.scp_codes = Y.scp_codes.apply(lambda x: ast.literal_eval(x))
+    _, aggregate_diagnostic = build_superclasses(path)
+    Y["diagnostic_superclass"] = Y.scp_codes.apply(aggregate_diagnostic)
+
+    TASK_TO_POS = {"norm_vs_mi": "MI", "norm_vs_sttc": "STTC", "norm_vs_cd": "CD", "norm_vs_hyp": "HYP"}
+    pos_class = TASK_TO_POS[args.task]
+    
+    labels = Y["diagnostic_superclass"].values
+    is_pos = np.array([pos_class in l for l in labels])
+    is_norm = np.array(["NORM" in l for l in labels])
+    keep = (is_pos ^ is_norm)
+    Yf = Y[keep].copy()
+    y_bin = np.array([1 if pos_class in l else 0 for l in Yf["diagnostic_superclass"].values], dtype=np.int64)
+
+    print(f"Loading signals at {args.sampling_rate}Hz ...")
+    X = load_raw_data(Yf, args.sampling_rate, path)
+    X = np.transpose(X, (0, 2, 1))  # [N, 12, L]
+    N, C, Lsig = X.shape
+    print(f"Data Shape: {X.shape}")
+
+    fold = Yf["strat_fold"].values
+    train_mask = (fold >= 1) & (fold <= 8)
+    val_mask = (fold >= 9)
+
+    X_train, y_train = X[train_mask], y_bin[train_mask]
+    X_val, y_val     = X[val_mask], y_bin[val_mask]
+
+    X_train_t = torch.from_numpy(X_train).float()
+    y_train_t = torch.from_numpy(y_train).float()
+    X_val_t   = torch.from_numpy(X_val).float()
+    y_val_t   = torch.from_numpy(y_val).float()
+
+    # Weighting for BCE (pos_weight)
+    n_pos = float((y_train_t == 1).sum())
+    n_neg = float((y_train_t == 0).sum())
+    pos_weight = n_neg / max(n_pos, 1.0)
+    print(f"Positive Class Weight: {pos_weight:.4f}")
+
+    train_ds = PTBXLBinaryDataset(X_train_t, y_train_t)
+    val_ds   = PTBXLBinaryDataset(X_val_t, y_val_t)
+    
+    val_loader = DataLoader(val_ds, batch_size=args.batch_size, shuffle=False, 
+                            num_workers=args.num_workers, pin_memory=(device=="cuda"))
+
+    if args.inference_only:
+        print("Inference-only mode. Loading checkpoint:", args.ckpt)
+        lit = IMNLightning.load_from_checkpoint(args.ckpt, map_location=device)
+    else:
+        train_loader = DataLoader(train_ds, batch_size=args.batch_size, shuffle=True, 
+                                  num_workers=args.num_workers, pin_memory=(device=="cuda"))
+
+        lit = IMNLightning(
+            input_channels=C,
+            signal_len=Lsig,
+            dropout=args.dropout,
+            lr=args.lr,
+            weight_decay=args.weight_decay,
+            lambda_l1=args.lambda_l1,
+            pos_weight=pos_weight, # Scalar weight
+            scheduler_type=args.scheduler if args.scheduler != "none" else None,
+            scheduler_params=scheduler_params,
+        )
+
+        wandb_logger = WandbLogger(
+            project=args.wandb_project,
+            name=args.wandb_name or timestamp,
+            save_dir=run_dir,
+            offline=args.wandb_offline
+        )
+
+        ckpt_cb = ModelCheckpoint(
+            dirpath=run_dir,
+            filename="best-imn-{epoch:02d}-{val_auc:.4f}",
+            monitor=args.early_stop_monitor,
+            mode=args.early_stop_mode,
+            save_top_k=1,
+            save_last=True,
+            verbose=True,
+        )
+        es_cb = EarlyStopping(
+            monitor=args.early_stop_monitor,
+            mode=args.early_stop_mode,
+            patience=args.early_stop_patience,
+            min_delta=args.early_stop_min_delta,
+            verbose=True,
+        )
+        lr_monitor = LearningRateMonitor(logging_interval="epoch")
+
+        trainer = pl.Trainer(
+            max_epochs=args.epochs,
+            accelerator=args.accelerator,
+            devices=args.devices,
+            callbacks=[ckpt_cb, es_cb, lr_monitor],
+            logger=wandb_logger,
+            log_every_n_steps=20,
+            deterministic=True,
+        )
+
+        trainer.fit(lit, train_loader, val_loader)
+
+        best_path = ckpt_cb.best_model_path
+        if best_path and os.path.exists(best_path):
+            print("Loading best:", best_path)
+            lit = IMNLightning.load_from_checkpoint(best_path, map_location=device)
+
+        trainer = pl.Trainer(accelerator=args.accelerator, devices=args.devices)
+        trainer.test(lit, val_loader)
+
+    lit = lit.to(device)
+    lit.model.to(device)
+    lit.eval()
+    
+    # Save Metrics
+    model_device = next(lit.model.parameters()).device
+    y_true, y_pred, y_prob = [], [], []
+    with torch.no_grad():
+        for x, y in val_loader:
+            x = x.to(model_device)
+            logits, _, _ = lit.model(x)
+            prob = torch.sigmoid(logits.squeeze(1))
+            pred = (prob > 0.5).long()
+            y_true.extend(y.cpu().numpy())
+            y_pred.extend(pred.cpu().numpy())
+            y_prob.extend(prob.cpu().numpy())
+    
+    metrics = {
+        "accuracy": accuracy_score(y_true, y_pred),
+        "balanced_accuracy": balanced_accuracy_score(y_true, y_pred),
+        "precision": precision_score(y_true, y_pred, average="binary", zero_division=0),
+        "recall": recall_score(y_true, y_pred, average="binary", zero_division=0),
+        "f1_score": f1_score(y_true, y_pred, average="binary", zero_division=0),
+        "mcc": matthews_corrcoef(y_true, y_pred),
+        "auroc": roc_auc_score(y_true, y_prob) if len(np.unique(y_true)) > 1 else float("nan"),
+    }
+    pd.DataFrame([metrics]).to_csv(os.path.join(run_dir, "metrics.csv"), index=False)
+    print("Metrics:", metrics)
+
+    # Visualization
+    default_window = 50 if args.sampling_rate == 100 else 250
+    windows = args.window if args.window else [default_window]
+    strides = args.stride if args.stride else [w // 2 for w in windows]
+    if len(strides) < len(windows):
+        strides = strides + [strides[-1] if strides else default_window // 2] * (len(windows) - len(strides))
+    elif len(strides) > len(windows):
+        strides = strides[:len(windows)]
+    viz_pairs = list(zip(windows, strides))
+
+    for viz_window, viz_stride in viz_pairs:
+        base_name = os.path.splitext(args.viz_pdf)[0]
+        ext = os.path.splitext(args.viz_pdf)[1] or ".pdf"
+        pdf_name = f"{base_name}_w{viz_window}_s{viz_stride}{ext}" if len(viz_pairs) > 1 else args.viz_pdf
+        pdf_path = pdf_name if os.path.isabs(pdf_name) else os.path.join(run_dir, pdf_name)
+
+        print(f"Generating IMN explanations (window={viz_window}, stride={viz_stride}) to {pdf_path}...")
+        visualize_imn_to_pdf(
+            model=lit.model,
+            dataset=val_ds,
+            device=model_device,
+            pdf_path=pdf_path,
+            sampling_rate=args.sampling_rate,
+            window=viz_window,
+            stride=viz_stride,
+            n_pos=args.n_pos_viz,
+            n_neg=args.n_neg_viz,
+            pos_class_name=pos_class,
+            random_pick=args.viz_random,
+            seed=123,
+            lambda_l1=args.lambda_l1,
+            viz_negative_class=args.viz_negative_class
+        )
+    print("Done.")
+
+if __name__ == "__main__":
+    main()
