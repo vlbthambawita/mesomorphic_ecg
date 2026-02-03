@@ -19,6 +19,7 @@ import ast
 import json
 import os
 import random
+from math import ceil
 import numpy as np
 import pandas as pd
 import wfdb
@@ -33,6 +34,13 @@ from torch.utils.data import Dataset, DataLoader
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
 import matplotlib.colors as mcolors
+from matplotlib.ticker import AutoMinorLocator
+
+try:
+    import ecg_plot
+    ECG_PLOT_AVAILABLE = True
+except ImportError:
+    ECG_PLOT_AVAILABLE = False
 
 import pytorch_lightning as pl
 from pytorch_lightning.callbacks import EarlyStopping, ModelCheckpoint, LearningRateMonitor
@@ -389,6 +397,43 @@ def simple_auc_roc(y_true: torch.Tensor, y_score: torch.Tensor) -> float:
 # -----------------------
 # Visualization Helpers (Intrinsic IMN)
 # -----------------------
+DEFAULT_LEAD_NAMES = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
+
+
+def parse_lead_indices(leads_str: str | None, lead_names: list | None = None) -> list[int] | None:
+    """
+    Parse lead selection string into list of 0-based indices.
+    Examples: "0,1,2,3" "I,II,III,V1" "0-5" "V1,V2,V3,V4,V5,V6"
+    Returns None if leads_str is None/empty (meaning all leads).
+    """
+    if not leads_str or not str(leads_str).strip():
+        return None
+    lead_names = lead_names or DEFAULT_LEAD_NAMES
+    name_to_idx = {n.upper(): i for i, n in enumerate(lead_names)}
+    name_to_idx.update({n: i for i, n in enumerate(lead_names)})  # case-sensitive fallback
+    result = []
+    for part in str(leads_str).replace(" ", "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part and not part.startswith("-"):
+            lo, hi = part.split("-", 1)
+            try:
+                lo_i, hi_i = int(lo.strip()), int(hi.strip())
+                result.extend(range(lo_i, hi_i + 1))
+            except ValueError:
+                pass
+        elif part.upper() in name_to_idx:
+            result.append(name_to_idx[part.upper()])
+        else:
+            try:
+                result.append(int(part))
+            except ValueError:
+                if part.upper() in name_to_idx:
+                    result.append(name_to_idx[part.upper()])
+    return sorted(set(i for i in result if 0 <= i < 12)) if result else None
+
+
 def imn_weights_to_segments(impact_12L: np.ndarray, window: int, stride: int) -> np.ndarray:
     """
     Aggregates point-wise feature attribution (Impact) into segments.
@@ -413,7 +458,10 @@ def visualize_imn_to_pdf(model, dataset, device, pdf_path: str,
                          pos_class_name: str = "MI",
                          random_pick: bool = False, seed: int = 123,
                          lead_names=None, lambda_l1: float = 1e-4,
-                         viz_negative_class: bool = False):
+                         viz_negative_class: bool = False,
+                         lead_indices: list[int] | None = None,
+                         heatmap_height: float = 1.0,
+                         ecg_height: float = 0.65):
     """
     Visualizes IMN Feature Attributions for SINGLE LINEAR OUTPUT.
     Equation: Logit = sum(w * x) + b
@@ -423,8 +471,10 @@ def visualize_imn_to_pdf(model, dataset, device, pdf_path: str,
     """
     model.eval()
     if lead_names is None:
-        lead_names = ["I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"]
-        
+        lead_names = list(DEFAULT_LEAD_NAMES)
+    lead_indices = lead_indices if lead_indices is not None else list(range(12))
+    n_leads = len(lead_indices)
+
     os.makedirs(os.path.dirname(pdf_path) or ".", exist_ok=True)
     
     # Select indices
@@ -483,27 +533,30 @@ def visualize_imn_to_pdf(model, dataset, device, pdf_path: str,
             cmap = "Blues" if is_norm_sample else "Reds"
             shade_color = "blue" if is_norm_sample else "red"
             
-            # Plotting
-            fig = plt.figure(figsize=(11.7, 16.5))
-            gs = fig.add_gridspec(14, 1, height_ratios=[2] + [1]*12 + [0.5])
+            # Plotting: minimal hspace to attach lead subplots, compact lead heights
+            fig = plt.figure(figsize=(11.7, max(8, heatmap_height + n_leads * ecg_height)))
+            gs = fig.add_gridspec(n_leads + 2, 1, height_ratios=[heatmap_height] + [ecg_height] * n_leads + [0.4], hspace=0.01)
 
-            # Heatmap Top
+            # Heatmap Top (subset of leads)
+            seg_hm_sel = seg_hm[lead_indices]
             ax0 = fig.add_subplot(gs[0, 0])
-            im = ax0.imshow(seg_hm, aspect="auto", vmin=0, vmax=1, cmap=cmap)
-            ax0.set_yticks(range(12))
-            ax0.set_yticklabels(lead_names)
+            im = ax0.imshow(seg_hm_sel, aspect="auto", vmin=0, vmax=1, cmap=cmap)
+            ax0.set_yticks(range(n_leads))
+            ax0.set_yticklabels([lead_names[i] for i in lead_indices])
             ax0.set_xlabel(f"Segments (window={window}, stride={stride}, fs={sampling_rate}Hz)")
             
             title_prob = f"P({pos_class_name})={prob:.3f}"
             ax0.set_title(f"IMN Intrinsic Explanation (Single Linear) | {tag} | True={y_int} | {title_prob} | idx={idx}")
             fig.colorbar(im, ax=ax0, fraction=0.02, pad=0.01)
 
-            # Signal traces with shading
-            for lead in range(12):
-                ax = fig.add_subplot(gs[lead + 1, 0])
+            # Signal traces with shading (tight spacing between leads)
+            for k, lead in enumerate(lead_indices):
+                ax = fig.add_subplot(gs[k + 1, 0])
                 ax.plot(x_np[lead], linewidth=0.8, color='black', alpha=0.6)
                 ax.set_xlim(0, Lsig - 1)
-                ax.set_ylabel(lead_names[lead], rotation=0, labelpad=20, va="center")
+                ax.set_ylabel(lead_names[lead], rotation=0, labelpad=8, va="center", fontsize=8)
+                ax.set_yticklabels([])
+                ax.margins(y=0.02)
                 
                 # Shade based on importance
                 contrib = seg_hm[lead]
@@ -518,13 +571,335 @@ def visualize_imn_to_pdf(model, dataset, device, pdf_path: str,
                 ax.set_xticks([])
 
             # Footer
-            axf = fig.add_subplot(gs[13, 0])
+            axf = fig.add_subplot(gs[n_leads + 1, 0])
             axf.axis("off")
             axf.text(0, 0.5, f"IMN Feature Attribution: $|w \cdot x|$. Single Linear Function. L1 Reg={lambda_l1}", fontsize=10)
 
-            fig.tight_layout()
-            pdf.savefig(fig)
+            fig.tight_layout(pad=0.3)
+            pdf.savefig(fig, bbox_inches="tight", pad_inches=0.05)
             plt.close(fig)
+
+
+# -----------------------
+# ECG Plot Visualization (ecg_plot library)
+# -----------------------
+def visualize_ecg_with_ecg_plot(
+    ecg: np.ndarray,
+    sample_rate: int = 500,
+    title: str = "ECG",
+    save_path: str | None = None,
+    lead_names: list | None = None,
+    columns: int = 2,
+    style: str | None = None,
+) -> None:
+    """
+    Visualize ECG using the ecg_plot library (https://github.com/dy1901/ecg_plot).
+
+    Args:
+        ecg: ECG signal data. Shape (12, L) for single 12-lead or (N, 12, L) for batch.
+             ecg_plot expects m x n where m=leads, n=signal length.
+        sample_rate: Sample rate in Hz (default 500).
+        title: Title for the plot.
+        save_path: If provided, save PNG to this path (directory created if needed).
+        lead_names: Lead labels, defaults to standard 12-lead order.
+        columns: Number of display columns (default 2).
+        style: Display style, e.g. 'bw' for black/white.
+    """
+    if not ECG_PLOT_AVAILABLE:
+        raise ImportError("ecg_plot is not installed. Run: pip install ecg_plot")
+
+    if ecg.ndim == 3:
+        ecg = ecg[0]  # Take first sample from batch
+    assert ecg.ndim == 2 and ecg.shape[0] == 12, "ecg must be (12, L) or (N, 12, L)"
+
+    # ecg_plot expects (leads, samples) - our data is already [12, L]
+    # Do not pass lead_index=None - it overrides ecg_plot's default and causes TypeError
+    plot_kwargs = dict(
+        sample_rate=sample_rate,
+        title=title,
+        columns=columns,
+    )
+    if lead_names is not None:
+        plot_kwargs["lead_index"] = lead_names
+    if style is not None:
+        plot_kwargs["style"] = style
+    ecg_plot.plot(ecg, **plot_kwargs)
+
+    if save_path:
+        out_dir = os.path.dirname(save_path) or "."
+        os.makedirs(out_dir, exist_ok=True)
+        base_name = os.path.splitext(os.path.basename(save_path))[0]
+        path_for_ecg = out_dir + "/" if out_dir and not out_dir.endswith("/") else (out_dir or "./")
+        ecg_plot.save_as_png(base_name, path_for_ecg)
+    else:
+        ecg_plot.show()
+
+
+def visualize_ecg_batch_with_ecg_plot(
+    ecg_batch: np.ndarray,
+    sample_rate: int = 500,
+    out_dir: str = "ecg_plots",
+    n_samples: int = 5,
+    title_prefix: str = "ECG",
+    random_indices: bool = False,
+    seed: int = 42,
+) -> list[str]:
+    """
+    Visualize multiple ECG samples using ecg_plot and save to PNG files.
+
+    Args:
+        ecg_batch: Shape (N, 12, L).
+        sample_rate: Sample rate in Hz.
+        out_dir: Output directory for PNG files.
+        n_samples: Number of samples to plot.
+        title_prefix: Prefix for plot titles.
+        random_indices: If True, pick random samples; else first n_samples.
+        seed: Random seed when random_indices=True.
+
+    Returns:
+        List of saved file paths.
+    """
+    if not ECG_PLOT_AVAILABLE:
+        raise ImportError("ecg_plot is not installed. Run: pip install ecg_plot")
+
+    os.makedirs(out_dir, exist_ok=True)
+    N = ecg_batch.shape[0]
+    n_plot = min(n_samples, N)
+
+    if random_indices:
+        rng = np.random.default_rng(seed)
+        indices = rng.choice(N, size=n_plot, replace=False)
+    else:
+        indices = np.arange(n_plot)
+
+    saved_paths = []
+    for i, idx in enumerate(indices):
+        ecg = ecg_batch[idx]  # (12, L)
+        title = f"{title_prefix} sample {idx}"
+        fname = os.path.join(out_dir, f"ecg_sample_{idx:04d}.png")
+        visualize_ecg_with_ecg_plot(
+            ecg,
+            sample_rate=sample_rate,
+            title=title,
+            save_path=fname,
+        )
+        saved_paths.append(fname)
+    return saved_paths
+
+
+def _draw_ecg_plot_style(ax, ecg: np.ndarray, sample_rate: int, lead_names: list,
+                         columns: int = 2, row_height: float = 0.5,
+                         style: str | None = None, half_signal: bool = False) -> None:
+    """
+    Draw ecg_plot-style 12-lead ECG in the given axes.
+    Replicates layout from https://github.com/dy1901/ecg_plot
+    Paper-optimized: minimal gap between leads (attached), optional half-signal display.
+    """
+    if half_signal:
+        ecg = ecg[:, : ecg.shape[1] // 2].copy()
+    lead_order = list(range(len(ecg)))
+    secs = len(ecg[0]) / sample_rate
+    leads = len(lead_order)
+    rows = int(ceil(leads / columns))
+    display_factor = 1.0
+    line_width = 0.5 * (display_factor ** 0.5)
+
+    x_min, x_max = 0, columns * secs
+    y_min = row_height / 4 - (rows / 2) * row_height
+    y_max = row_height / 4
+
+    if style == "bw":
+        color_major = (0.4, 0.4, 0.4)
+        color_minor = (0.75, 0.75, 0.75)
+        color_line = (0, 0, 0)
+    else:
+        color_major = (1, 0, 0)
+        color_minor = (1, 0.7, 0.7)
+        color_line = (0, 0, 0.7)
+
+    ax.set_xticks(np.arange(x_min, x_max + 0.01, 0.2))
+    tick_step = 0.25 if row_height < 1.5 else 0.5
+    ax.set_yticks(np.arange(y_min, y_max + 0.01, tick_step))
+    ax.set_yticklabels([])
+    ax.minorticks_on()
+    ax.xaxis.set_minor_locator(AutoMinorLocator(5))
+    ax.grid(which="major", linestyle="-", linewidth=0.5 * (display_factor ** 0.5), color=color_major)
+    ax.grid(which="minor", linestyle="-", linewidth=0.5 * (display_factor ** 0.5), color=color_minor)
+    ax.set_ylim(y_min, y_max)
+    ax.set_xlim(x_min, x_max)
+    ax.margins(0)
+    ax.autoscale(enable=False)
+
+    step = 1.0 / sample_rate
+    for c in range(columns):
+        for i in range(rows):
+            if c * rows + i >= leads:
+                break
+            t_lead = lead_order[c * rows + i]
+            y_offset = -(row_height / 2) * ceil(i % rows)
+            x_offset = secs * c if c > 0 else 0
+            sep_h = 0.12 * (row_height / 0.5)  # Scale separator with row_height
+            if c > 0:
+                ax.plot(
+                    [x_offset, x_offset],
+                    [ecg[t_lead][0] + y_offset - sep_h, ecg[t_lead][0] + y_offset + sep_h],
+                    linewidth=line_width,
+                    color=color_line,
+                )
+            ax.text(x_offset + 0.07, y_offset - row_height * 0.3, lead_names[t_lead], fontsize=7 * (display_factor ** 0.5))
+            ax.plot(
+                np.arange(0, len(ecg[t_lead]) * step, step) + x_offset,
+                ecg[t_lead] + y_offset,
+                linewidth=line_width,
+                color=color_line,
+            )
+
+
+def _draw_important_patches_on_ecg(
+    ax,
+    seg_hm: np.ndarray,
+    window: int,
+    stride: int,
+    sampling_rate: int,
+    shade_color: str = "red",
+    importance_threshold: float = 0.2,
+    max_alpha: float = 0.35,
+    columns: int = 2,
+    signal_len: int | None = None,
+    half_signal: bool = False,
+) -> None:
+    """
+    Overlay semi-transparent patches on ECG axes to mark important regions from IMN heatmap.
+    seg_hm: (12, T) segment importance, already normalized 0-1.
+    For 2-column ecg_plot layout, draws patches in both columns (same time range).
+    """
+    Tseg = seg_hm.shape[1]
+    full_secs = (signal_len / sampling_rate) if signal_len else (
+        max((Tseg - 1) * stride + window, window) / sampling_rate if Tseg > 0 else window / sampling_rate
+    )
+    secs = full_secs / 2 if half_signal else full_secs
+    for t in range(Tseg):
+        imp = float(np.max(seg_hm[:, t]))
+        if imp < importance_threshold:
+            continue
+        alpha = min(max_alpha, imp * 0.5)
+        start_sec = (t * stride) / sampling_rate
+        end_sec = (t * stride + window) / sampling_rate
+        if half_signal and end_sec > secs:
+            continue
+        # Column 0: x from 0 to secs
+        ax.axvspan(start_sec, end_sec, alpha=alpha, color=shade_color, zorder=0, linewidth=0)
+        # Column 1: x from secs to 2*secs (same time range, different x)
+        if columns > 1 and end_sec <= secs:
+            ax.axvspan(secs + start_sec, secs + end_sec, alpha=alpha, color=shade_color, zorder=0, linewidth=0)
+
+
+def visualize_ecg_with_imn_heatmap_to_pdf(
+    model,
+    dataset,
+    device,
+    pdf_path: str,
+    sampling_rate: int,
+    window: int,
+    stride: int,
+    n_samples: int = 5,
+    pos_class_name: str = "MI",
+    random_pick: bool = False,
+    seed: int = 42,
+    lead_names: list | None = None,
+    lambda_l1: float = 1e-4,
+    half_ecg: bool = True,
+    row_height: float = 0.5,
+    lead_indices: list[int] | None = None,
+    heatmap_height: float = 0.5,
+    ecg_height: float = 1.4,
+) -> None:
+    """
+    Visualize ECG with IMN heatmap on top, saved to PDF.
+    Combines ecg_plot-style 12-lead ECG with IMN feature attribution heatmap.
+    Paper-optimized: half ECG, compressed lead spacing, one sample per file.
+    """
+    model.eval()
+    if lead_names is None:
+        lead_names = list(DEFAULT_LEAD_NAMES)
+    lead_indices = lead_indices if lead_indices is not None else list(range(12))
+
+    out_dir = os.path.dirname(pdf_path) or "."
+    os.makedirs(out_dir, exist_ok=True)
+    base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+
+    N = len(dataset)
+    n_plot = min(n_samples, N)
+    if random_pick:
+        rng = np.random.default_rng(seed)
+        indices = rng.choice(N, size=n_plot, replace=False)
+    else:
+        indices = np.arange(n_plot)
+
+    saved_paths = []
+    for idx in indices:
+        x, y = dataset[idx]
+        y_int = int(y.item())
+        tag = pos_class_name if y_int == 1 else "NORM"
+        x_b = x.unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            logits, gen_w, _ = model(x_b)
+            prob = float(torch.sigmoid(logits)[0, 0].item())
+            w_used = gen_w[0, 0, :, :].cpu().numpy()
+
+        x_np = x.numpy()
+        impact = w_used * x_np
+        seg_hm = imn_weights_to_segments(impact, window=window, stride=stride)
+        Lsig = x.shape[1]
+
+        # Trim heatmap to first half when using half ECG
+        if half_ecg:
+            n_seg_half = max(1, (Lsig // 2 - window) // stride + 1)
+            seg_hm = seg_hm[:, :n_seg_half]
+
+        # Subset to selected leads
+        x_np_sel = x_np[lead_indices]
+        seg_hm_sel = seg_hm[lead_indices]
+        lead_names_sel = [lead_names[i] for i in lead_indices]
+
+        is_norm_sample = tag == "NORM"
+        cmap = "Blues" if is_norm_sample else "Reds"
+        shade_color = "blue" if is_norm_sample else "red"
+
+        # Paper-optimized figure: compact size, minimal gap between leads
+        fig = plt.figure(figsize=(7, 5.2))
+        gs = fig.add_gridspec(2, 1, height_ratios=[heatmap_height, ecg_height], hspace=0.1)
+
+        # Heatmap
+        ax_hm = fig.add_subplot(gs[0, 0])
+        im = ax_hm.imshow(seg_hm_sel, aspect="auto", vmin=0, vmax=1, cmap=cmap)
+        ax_hm.set_yticks(range(len(lead_indices)))
+        ax_hm.set_yticklabels(lead_names_sel, fontsize=7)
+        ax_hm.set_xlabel(f"Segments (w={window}, s={stride}, fs={sampling_rate}Hz)", fontsize=8)
+        ax_hm.set_title(f"IMN Heatmap | {tag} | P({pos_class_name})={prob:.3f} | idx={idx}", fontsize=9)
+        fig.colorbar(im, ax=ax_hm, fraction=0.02, pad=0.02, shrink=0.8)
+
+        # ECG (ecg_plot style): half signal, compressed leads
+        ax_ecg = fig.add_subplot(gs[1, 0])
+        _draw_ecg_plot_style(
+            ax_ecg, x_np_sel, sampling_rate, lead_names_sel,
+            columns=2, row_height=row_height, half_signal=half_ecg,
+        )
+        _draw_important_patches_on_ecg(
+            ax_ecg, seg_hm_sel, window, stride, sampling_rate,
+            shade_color=shade_color, signal_len=Lsig, half_signal=half_ecg,
+        )
+        n_leads_str = f"{len(lead_indices)}-lead" if len(lead_indices) != 12 else "12-lead"
+        ax_ecg.set_title(f"{n_leads_str} ECG (shaded = IMN important regions)", fontsize=8)
+
+        fig.tight_layout(pad=0.5)
+        sample_path = os.path.join(out_dir, f"{base_name}_{tag}_{idx:04d}.pdf")
+        fig.savefig(sample_path, bbox_inches="tight", pad_inches=0.08)
+        saved_paths.append(sample_path)
+        plt.close(fig)
+
+    print(f"Saved {len(saved_paths)} ECG+IMN heatmap PDFs to {out_dir}")
 
 
 # -----------------------
@@ -588,11 +963,51 @@ def main():
     parser.add_argument("--n_neg_viz", type=int, default=25)
     parser.add_argument("--viz_random", action="store_true")
     parser.add_argument("--viz_negative_class", action="store_true", help="Deprecated in single-linear mode, but kept for arg compatibility.")
+    parser.add_argument("--viz_ecg_plot", action="store_true",
+                        help="Visualize ECG samples using ecg_plot library (pip install ecg_plot).")
+    parser.add_argument("--viz_ecg_plot_n", type=int, default=5,
+                        help="Number of ECG samples to plot with ecg_plot when --viz_ecg_plot.")
+    # Reserved CLI flags for ECG+IMN plots (half-length ECG and one sample per file are defaults).
+    parser.add_argument(
+        "--half_ecg",
+        action="store_true",
+        help="Reserved flag for ECG+IMN plots; currently half-length ECG is used by default.",
+    )
+    parser.add_argument(
+        "--one_per_file",
+        action="store_true",
+        help="Reserved flag; ECG+IMN plots are saved one sample per file by default.",
+    )
+    parser.add_argument(
+        "--leads",
+        type=str,
+        default=None,
+        help="Leads to visualize: comma-separated indices (0-11) or names (I,II,III,aVR,aVL,aVF,V1-V6). "
+             "E.g. '0,1,2' or 'I,II,III' or 'V1,V2,V3,V4,V5,V6' or '0-5'. Default: all 12 leads.",
+    )
+    parser.add_argument(
+        "--viz_heatmap_height",
+        type=float,
+        default=None,
+        help="Height ratio for the top heatmap panel. Lower = shorter heatmap. "
+             "Default: 1.0 for IMN viz, 0.5 for ECG+heatmap viz.",
+    )
+    parser.add_argument(
+        "--viz_ecg_height",
+        type=float,
+        default=None,
+        help="Height ratio for the bottom ECG/lead traces panel. Lower = shorter. "
+             "Default: 0.65 per lead for IMN viz, 1.4 for ECG+heatmap viz.",
+    )
 
     args = parser.parse_args()
 
     if args.inference_only and not args.ckpt:
         parser.error("--ckpt is required when --inference_only")
+
+    lead_indices = parse_lead_indices(args.leads)
+    if lead_indices is not None:
+        print(f"Visualizing leads: {lead_indices} ({[DEFAULT_LEAD_NAMES[i] for i in lead_indices]})")
 
     set_seed(args.seed)
 
@@ -772,6 +1187,8 @@ def main():
         pdf_path = pdf_name if os.path.isabs(pdf_name) else os.path.join(run_dir, pdf_name)
 
         print(f"Generating IMN explanations (window={viz_window}, stride={viz_stride}) to {pdf_path}...")
+        heatmap_h = args.viz_heatmap_height if args.viz_heatmap_height is not None else 1.0
+        ecg_h = args.viz_ecg_height if args.viz_ecg_height is not None else 0.65
         visualize_imn_to_pdf(
             model=lit.model,
             dataset=val_ds,
@@ -786,8 +1203,37 @@ def main():
             random_pick=args.viz_random,
             seed=123,
             lambda_l1=args.lambda_l1,
-            viz_negative_class=args.viz_negative_class
+            viz_negative_class=args.viz_negative_class,
+            lead_indices=lead_indices,
+            heatmap_height=heatmap_h,
+            ecg_height=ecg_h,
         )
+
+    # ECG plot visualization with IMN heatmap (PDF format)
+    if args.viz_ecg_plot:
+        viz_window, viz_stride = viz_pairs[0] if viz_pairs else (default_window, default_window // 2)
+        ecg_pdf_path = os.path.join(run_dir, "ecg_with_imn_heatmap.pdf")
+        print(f"Generating ECG+IMN heatmap PDF to {ecg_pdf_path}...")
+        heatmap_h_ecg = args.viz_heatmap_height if args.viz_heatmap_height is not None else 0.5
+        ecg_h_ecg = args.viz_ecg_height if args.viz_ecg_height is not None else 1.4
+        visualize_ecg_with_imn_heatmap_to_pdf(
+            model=lit.model,
+            dataset=val_ds,
+            device=model_device,
+            pdf_path=ecg_pdf_path,
+            sampling_rate=args.sampling_rate,
+            window=viz_window,
+            stride=viz_stride,
+            n_samples=args.viz_ecg_plot_n,
+            pos_class_name=pos_class,
+            random_pick=args.viz_random,
+            seed=args.seed,
+            lambda_l1=args.lambda_l1,
+            lead_indices=lead_indices,
+            heatmap_height=heatmap_h_ecg,
+            ecg_height=ecg_h_ecg,
+        )
+
     print("Done.")
 
 if __name__ == "__main__":
