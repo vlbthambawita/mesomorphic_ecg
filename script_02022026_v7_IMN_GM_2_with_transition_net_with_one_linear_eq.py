@@ -33,6 +33,7 @@ from torch.utils.data import Dataset, DataLoader
 
 import matplotlib.pyplot as plt
 from matplotlib.backends.backend_pdf import PdfPages
+from matplotlib.patches import Rectangle
 import matplotlib.colors as mcolors
 from matplotlib.ticker import AutoMinorLocator
 
@@ -434,6 +435,52 @@ def parse_lead_indices(leads_str: str | None, lead_names: list | None = None) ->
     return sorted(set(i for i in result if 0 <= i < 12)) if result else None
 
 
+def get_top_k_leads(impact: np.ndarray, k: int) -> np.ndarray:
+    """Lead importance = mean(|impact|) over time. Returns top-k lead indices (0-based)."""
+    lead_imp = np.abs(impact).mean(axis=1)  # [12]
+    top_idx = np.argsort(lead_imp)[::-1][:k]
+    return top_idx.astype(np.int64)
+
+
+def get_top_k_segments(impact: np.ndarray, window: int, stride: int, k: int) -> np.ndarray:
+    """
+    Top-k segments by contribution to final logit.
+    Logit = sum(impact) + b, so segment t's contribution = |sum(impact[:, s:e])|.
+    Returns top-k segment indices (0-based).
+    """
+    assert impact.ndim == 2
+    L = impact.shape[1]
+    T = (L - window) // stride + 1
+    seg_contrib = np.zeros(T, dtype=np.float64)
+    for t in range(T):
+        s = t * stride
+        e = min(s + window, L)
+        seg_contrib[t] = np.abs(np.sum(impact[:, s:e]))
+    top_idx = np.argsort(seg_contrib)[::-1][:k]
+    return top_idx.astype(np.int64)
+
+
+def get_top_k_segments_per_lead(impact: np.ndarray, window: int, stride: int, k: int) -> list[set[int]]:
+    """
+    Top-k segments per lead by that lead's contribution.
+    For lead c, segment t contribution = |sum(impact[c, s:e])|.
+    Returns list of sets: top_seg_per_lead[lead] = set of segment indices.
+    """
+    assert impact.ndim == 2
+    n_leads, L = impact.shape
+    T = (L - window) // stride + 1
+    result = []
+    for c in range(n_leads):
+        seg_contrib = np.zeros(T, dtype=np.float64)
+        for t in range(T):
+            s = t * stride
+            e = min(s + window, L)
+            seg_contrib[t] = np.abs(np.sum(impact[c, s:e]))
+        top_idx = np.argsort(seg_contrib)[::-1][:min(k, T)]
+        result.append(set(top_idx.tolist()))
+    return result
+
+
 def imn_weights_to_segments(impact_12L: np.ndarray, window: int, stride: int) -> np.ndarray:
     """
     Aggregates point-wise feature attribution (Impact) into segments.
@@ -461,7 +508,9 @@ def visualize_imn_to_pdf(model, dataset, device, pdf_path: str,
                          viz_negative_class: bool = False,
                          lead_indices: list[int] | None = None,
                          heatmap_height: float = 1.0,
-                         ecg_height: float = 0.65):
+                         ecg_height: float = 0.65,
+                         top_k_leads: int | None = None,
+                         top_k_segments: int | None = None):
     """
     Visualizes IMN Feature Attributions for SINGLE LINEAR OUTPUT.
     Equation: Logit = sum(w * x) + b
@@ -472,8 +521,7 @@ def visualize_imn_to_pdf(model, dataset, device, pdf_path: str,
     model.eval()
     if lead_names is None:
         lead_names = list(DEFAULT_LEAD_NAMES)
-    lead_indices = lead_indices if lead_indices is not None else list(range(12))
-    n_leads = len(lead_indices)
+    base_lead_indices = lead_indices if lead_indices is not None else list(range(12))
 
     os.makedirs(os.path.dirname(pdf_path) or ".", exist_ok=True)
     
@@ -529,51 +577,93 @@ def visualize_imn_to_pdf(model, dataset, device, pdf_path: str,
             Tseg = seg_hm.shape[1]
             Lsig = x.shape[1]
 
+            # Per-sample top-k: compute indices for marking; use full 12 leads when marking
+            top_k_lead_indices = None
+            if top_k_leads is not None:
+                top_k_lead_indices = set(get_top_k_leads(impact, min(top_k_leads, 12)).tolist())
+            use_full_12 = top_k_leads is not None or top_k_segments is not None
+            lead_indices = list(range(12)) if use_full_12 else list(base_lead_indices)
+            n_leads = len(lead_indices)
+
+            # Per-sample top-k segments: per lead (top segments for each lead separately)
+            top_seg_per_lead = None
+            if top_k_segments is not None:
+                top_seg_per_lead = get_top_k_segments_per_lead(impact, window, stride, min(top_k_segments, Tseg))
+
+            # Lead labels: add ★ for top-k leads when marking
+            def _lead_label(i: int) -> str:
+                lbl = lead_names[i]
+                if top_k_lead_indices is not None and i in top_k_lead_indices:
+                    lbl = f"{lbl}★"
+                return lbl
+
             # Colors
-            cmap = "Blues" if is_norm_sample else "Reds"
             shade_color = "blue" if is_norm_sample else "red"
-            
-            # Plotting: minimal hspace to attach lead subplots, compact lead heights
-            fig = plt.figure(figsize=(11.7, max(8, heatmap_height + n_leads * ecg_height)))
-            gs = fig.add_gridspec(n_leads + 2, 1, height_ratios=[heatmap_height] + [ecg_height] * n_leads + [0.4], hspace=0.01)
-
-            # Heatmap Top (subset of leads)
-            seg_hm_sel = seg_hm[lead_indices]
-            ax0 = fig.add_subplot(gs[0, 0])
-            im = ax0.imshow(seg_hm_sel, aspect="auto", vmin=0, vmax=1, cmap=cmap)
-            ax0.set_yticks(range(n_leads))
-            ax0.set_yticklabels([lead_names[i] for i in lead_indices])
-            ax0.set_xlabel(f"Segments (window={window}, stride={stride}, fs={sampling_rate}Hz)")
-            
             title_prob = f"P({pos_class_name})={prob:.3f}"
-            ax0.set_title(f"IMN Intrinsic Explanation (Single Linear) | {tag} | True={y_int} | {title_prob} | idx={idx}")
-            fig.colorbar(im, ax=ax0, fraction=0.02, pad=0.01)
+            topk_leads_str = f" | top-{top_k_leads} leads" if top_k_leads else ""
+            topk_seg_str = f" | top-{top_k_segments} segs" if top_k_segments else ""
 
-            # Signal traces with shading (tight spacing between leads)
+            # Top-k mode: no heatmap, only ECG with marks. Otherwise: heatmap + ECG.
+            show_heatmap = not use_full_12
+            if show_heatmap:
+                fig = plt.figure(figsize=(11.7, max(8, heatmap_height + n_leads * ecg_height)))
+                gs = fig.add_gridspec(n_leads + 2, 1, height_ratios=[heatmap_height] + [ecg_height] * n_leads + [0.4], hspace=0.01)
+                cmap = "Blues" if is_norm_sample else "Reds"
+                seg_hm_plot = seg_hm[lead_indices]
+                if top_seg_per_lead is not None:
+                    all_top = set()
+                    for s in top_seg_per_lead:
+                        all_top |= s
+                    seg_hm_plot = seg_hm_plot[:, sorted(all_top)] if all_top else seg_hm_plot
+                ax0 = fig.add_subplot(gs[0, 0])
+                im = ax0.imshow(seg_hm_plot, aspect="auto", vmin=0, vmax=1, cmap=cmap)
+                ax0.set_yticks(range(n_leads))
+                ax0.set_yticklabels([_lead_label(i) for i in lead_indices])
+                seg_label = f"Top-{top_k_segments} segments per lead" if top_seg_per_lead else f"Segments (window={window}, stride={stride}, fs={sampling_rate}Hz)"
+                ax0.set_xlabel(seg_label)
+                ax0.set_title(f"IMN Intrinsic Explanation (Single Linear) | {tag} | True={y_int} | {title_prob} | idx={idx}{topk_leads_str}")
+                fig.colorbar(im, ax=ax0, fraction=0.02, pad=0.01)
+                gs_offset = 1
+            else:
+                fig = plt.figure(figsize=(11.7, max(8, n_leads * ecg_height + 0.5)))
+                gs = fig.add_gridspec(n_leads + 1, 1, height_ratios=[ecg_height] * n_leads + [0.4], hspace=0.01)
+                gs_offset = 0
+
+            # Signal traces with shading (whole 12 leads; ★ marks top-k leads, shading marks top-k segments)
             for k, lead in enumerate(lead_indices):
-                ax = fig.add_subplot(gs[k + 1, 0])
-                ax.plot(x_np[lead], linewidth=0.8, color='black', alpha=0.6)
+                ax = fig.add_subplot(gs[k + gs_offset, 0])
+                is_top = top_k_lead_indices is not None and lead in top_k_lead_indices
+                ax.plot(x_np[lead], linewidth=1.0 if is_top else 0.8, color='black', alpha=0.6)
+                if is_top:
+                    ax.set_facecolor((1, 0.95, 0.9) if not is_norm_sample else (0.95, 0.97, 1))
                 ax.set_xlim(0, Lsig - 1)
-                ax.set_ylabel(lead_names[lead], rotation=0, labelpad=8, va="center", fontsize=8)
+                ax.set_ylabel(_lead_label(lead), rotation=0, labelpad=8, va="center", fontsize=8, fontweight="bold" if is_top else "normal")
                 ax.set_yticklabels([])
                 ax.margins(y=0.02)
                 
-                # Shade based on importance
-                contrib = seg_hm[lead]
+                # Top-k segments per lead: highlight only on the corresponding lead
+                segs_for_lead = top_seg_per_lead[lead] if top_seg_per_lead is not None else set()
                 for t in range(Tseg):
-                    a = float(contrib[t])
-                    alpha = min(0.5, a * 0.6)
-                    if alpha > 0.05:
-                        start = t * stride
-                        end = min(start + window, Lsig)
-                        ax.axvspan(start, end, alpha=alpha, color=shade_color, linewidth=0)
+                    if t not in segs_for_lead:
+                        continue
+                    alpha = 0.25
+                    start = t * stride
+                    end = min(start + window, Lsig)
+                    ax.axvspan(start, end, alpha=alpha, color=shade_color, linewidth=0, zorder=0)
+                    ylo, yhi = ax.get_ylim()
+                    rect = Rectangle((start, ylo), end - start, yhi - ylo,
+                                     fill=False, edgecolor=shade_color, linewidth=1.5, zorder=2)
+                    ax.add_patch(rect)
                 
                 ax.set_xticks([])
 
             # Footer
-            axf = fig.add_subplot(gs[n_leads + 1, 0])
+            axf = fig.add_subplot(gs[n_leads + gs_offset, 0])
             axf.axis("off")
-            axf.text(0, 0.5, f"IMN Feature Attribution: $|w \cdot x|$. Single Linear Function. L1 Reg={lambda_l1}", fontsize=10)
+            footer = f"IMN Feature Attribution: $|w \cdot x|$. Single Linear Function. L1 Reg={lambda_l1}"
+            if not show_heatmap:
+                footer = f"{tag} | True={y_int} | P({pos_class_name})={prob:.3f} | idx={idx}{topk_leads_str}{topk_seg_str}. ★ = top-k leads, boxed = top-k segments per lead. {footer}"
+            axf.text(0, 0.5, footer, fontsize=10)
 
             fig.tight_layout(pad=0.3)
             pdf.savefig(fig, bbox_inches="tight", pad_inches=0.05)
@@ -767,31 +857,61 @@ def _draw_important_patches_on_ecg(
     columns: int = 2,
     signal_len: int | None = None,
     half_signal: bool = False,
+    draw_bbox: bool = False,
+    per_lead: bool = False,
+    row_height: float = 0.5,
 ) -> None:
     """
     Overlay semi-transparent patches on ECG axes to mark important regions from IMN heatmap.
-    seg_hm: (12, T) segment importance, already normalized 0-1.
-    For 2-column ecg_plot layout, draws patches in both columns (same time range).
+    seg_hm: (n_leads, T) segment importance, 0-1.
+    For 2-column ecg_plot layout. If per_lead=True, draws only in each lead's y band.
     """
-    Tseg = seg_hm.shape[1]
+    n_leads, Tseg = seg_hm.shape
     full_secs = (signal_len / sampling_rate) if signal_len else (
         max((Tseg - 1) * stride + window, window) / sampling_rate if Tseg > 0 else window / sampling_rate
     )
     secs = full_secs / 2 if half_signal else full_secs
+    ylo, yhi = ax.get_ylim()
+    rows = int(ceil(n_leads / columns))
+    band_h = row_height / 2
+
+    def _draw_rect(x_lo: float, y_lo: float, w: float, h: float, alpha: float) -> None:
+        ax.add_patch(Rectangle((x_lo, y_lo), w, h, facecolor=shade_color, alpha=alpha, zorder=0, linewidth=0))
+        if draw_bbox:
+            ax.add_patch(Rectangle((x_lo, y_lo), w, h, fill=False, edgecolor=shade_color, linewidth=1.5, zorder=2))
+
     for t in range(Tseg):
-        imp = float(np.max(seg_hm[:, t]))
-        if imp < importance_threshold:
-            continue
-        alpha = min(max_alpha, imp * 0.5)
         start_sec = (t * stride) / sampling_rate
         end_sec = (t * stride + window) / sampling_rate
         if half_signal and end_sec > secs:
             continue
-        # Column 0: x from 0 to secs
-        ax.axvspan(start_sec, end_sec, alpha=alpha, color=shade_color, zorder=0, linewidth=0)
-        # Column 1: x from secs to 2*secs (same time range, different x)
-        if columns > 1 and end_sec <= secs:
-            ax.axvspan(secs + start_sec, secs + end_sec, alpha=alpha, color=shade_color, zorder=0, linewidth=0)
+        w = end_sec - start_sec
+
+        if per_lead:
+            for lead_idx in range(n_leads):
+                imp = float(seg_hm[lead_idx, t])
+                if imp < importance_threshold:
+                    continue
+                row = lead_idx % rows
+                col = lead_idx // rows
+                y_offset = -(row_height / 2) * row
+                y_lead_lo = y_offset - band_h
+                y_lead_hi = y_offset + band_h
+                h_lead = y_lead_hi - y_lead_lo
+                alpha = min(max_alpha, 0.25)
+                if col == 0:
+                    _draw_rect(start_sec, y_lead_lo, w, h_lead, alpha)
+                else:
+                    _draw_rect(secs + start_sec, y_lead_lo, w, h_lead, alpha)
+        else:
+            imp = float(np.max(seg_hm[:, t]))
+            if imp < importance_threshold:
+                continue
+            alpha = min(max_alpha, imp * 0.5)
+            h = yhi - ylo
+            _draw_rect(start_sec, ylo, w, h, alpha)
+            if columns > 1 and end_sec <= secs:
+                _draw_rect(secs + start_sec, ylo, w, h, alpha)
 
 
 def visualize_ecg_with_imn_heatmap_to_pdf(
@@ -813,6 +933,8 @@ def visualize_ecg_with_imn_heatmap_to_pdf(
     lead_indices: list[int] | None = None,
     heatmap_height: float = 0.5,
     ecg_height: float = 1.4,
+    top_k_leads: int | None = None,
+    top_k_segments: int | None = None,
 ) -> None:
     """
     Visualize ECG with IMN heatmap on top, saved to PDF.
@@ -822,7 +944,7 @@ def visualize_ecg_with_imn_heatmap_to_pdf(
     model.eval()
     if lead_names is None:
         lead_names = list(DEFAULT_LEAD_NAMES)
-    lead_indices = lead_indices if lead_indices is not None else list(range(12))
+    base_lead_indices = lead_indices if lead_indices is not None else list(range(12))
 
     out_dir = os.path.dirname(pdf_path) or "."
     os.makedirs(out_dir, exist_ok=True)
@@ -857,41 +979,90 @@ def visualize_ecg_with_imn_heatmap_to_pdf(
         if half_ecg:
             n_seg_half = max(1, (Lsig // 2 - window) // stride + 1)
             seg_hm = seg_hm[:, :n_seg_half]
+            impact_for_seg = impact[:, : Lsig // 2]  # top-k from displayed region only
+        else:
+            impact_for_seg = impact
+        Tseg = seg_hm.shape[1]
 
-        # Subset to selected leads
+        # Per-sample top-k: compute for marking; use full 12 leads when marking
+        top_k_lead_indices = None
+        if top_k_leads is not None:
+            top_k_lead_indices = set(get_top_k_leads(impact, min(top_k_leads, 12)).tolist())
+
+        use_full_12 = top_k_leads is not None or top_k_segments is not None
+        lead_indices = list(range(12)) if use_full_12 else list(base_lead_indices)
+
+        # Per-sample top-k segments: per lead (over displayed region only)
+        top_seg_per_lead = None
+        if top_k_segments is not None:
+            top_seg_per_lead = get_top_k_segments_per_lead(impact_for_seg, window, stride, min(top_k_segments, Tseg))
+
+        # Lead labels: add ★ for top-k leads
+        def _lead_label(i: int) -> str:
+            lbl = lead_names[i]
+            if top_k_lead_indices is not None and i in top_k_lead_indices:
+                lbl = f"{lbl}★"
+            return lbl
+
         x_np_sel = x_np[lead_indices]
-        seg_hm_sel = seg_hm[lead_indices]
-        lead_names_sel = [lead_names[i] for i in lead_indices]
+        lead_names_sel = [_lead_label(i) for i in lead_indices]
+
+        # For heatmap: full 12 or subset; optionally top-k segments
+        seg_hm_plot = seg_hm[lead_indices]
+        if top_seg_per_lead is not None:
+            all_top = set()
+            for s in top_seg_per_lead:
+                all_top |= s
+            if all_top:
+                seg_hm_plot = seg_hm_plot[:, sorted(all_top)]
+        # For ECG shading: per-lead top segments
+        seg_hm_shade = seg_hm[lead_indices].copy()
+        if top_seg_per_lead is not None:
+            for i, lead_idx in enumerate(lead_indices):
+                segs = top_seg_per_lead[lead_idx]
+                for t in range(Tseg):
+                    seg_hm_shade[i, t] = 1.0 if t in segs else 0
 
         is_norm_sample = tag == "NORM"
-        cmap = "Blues" if is_norm_sample else "Reds"
         shade_color = "blue" if is_norm_sample else "red"
 
-        # Paper-optimized figure: compact size, minimal gap between leads
-        fig = plt.figure(figsize=(7, 5.2))
-        gs = fig.add_gridspec(2, 1, height_ratios=[heatmap_height, ecg_height], hspace=0.1)
+        # Top-k mode: no heatmap, only ECG with marks. Otherwise: heatmap + ECG.
+        show_heatmap = not use_full_12
+        if show_heatmap:
+            fig = plt.figure(figsize=(7, 5.2))
+            gs = fig.add_gridspec(2, 1, height_ratios=[heatmap_height, ecg_height], hspace=0.1)
+            cmap = "Blues" if is_norm_sample else "Reds"
+            ax_hm = fig.add_subplot(gs[0, 0])
+            im = ax_hm.imshow(seg_hm_plot, aspect="auto", vmin=0, vmax=1, cmap=cmap)
+            ax_hm.set_yticks(range(len(lead_indices)))
+            ax_hm.set_yticklabels(lead_names_sel, fontsize=7)
+            seg_label = f"Top-{top_k_segments} segments per lead" if top_seg_per_lead else f"Segments (w={window}, s={stride}, fs={sampling_rate}Hz)"
+            ax_hm.set_xlabel(seg_label, fontsize=8)
+            topk_str = (f" | top-{top_k_leads} leads" if top_k_leads else "") + (f" | top-{top_k_segments} segs" if top_k_segments else "")
+            ax_hm.set_title(f"IMN Heatmap | {tag} | P({pos_class_name})={prob:.3f} | idx={idx}{topk_str}", fontsize=9)
+            fig.colorbar(im, ax=ax_hm, fraction=0.02, pad=0.02, shrink=0.8)
+            ax_ecg = fig.add_subplot(gs[1, 0])
+        else:
+            fig = plt.figure(figsize=(7, 4.5))
+            gs = fig.add_gridspec(1, 1)
+            ax_ecg = fig.add_subplot(gs[0, 0])
 
-        # Heatmap
-        ax_hm = fig.add_subplot(gs[0, 0])
-        im = ax_hm.imshow(seg_hm_sel, aspect="auto", vmin=0, vmax=1, cmap=cmap)
-        ax_hm.set_yticks(range(len(lead_indices)))
-        ax_hm.set_yticklabels(lead_names_sel, fontsize=7)
-        ax_hm.set_xlabel(f"Segments (w={window}, s={stride}, fs={sampling_rate}Hz)", fontsize=8)
-        ax_hm.set_title(f"IMN Heatmap | {tag} | P({pos_class_name})={prob:.3f} | idx={idx}", fontsize=9)
-        fig.colorbar(im, ax=ax_hm, fraction=0.02, pad=0.02, shrink=0.8)
-
-        # ECG (ecg_plot style): half signal, compressed leads
-        ax_ecg = fig.add_subplot(gs[1, 0])
+        # ECG (ecg_plot style): half signal, compressed leads; ★ = top-k leads, shaded = top-k segments
         _draw_ecg_plot_style(
             ax_ecg, x_np_sel, sampling_rate, lead_names_sel,
             columns=2, row_height=row_height, half_signal=half_ecg,
         )
         _draw_important_patches_on_ecg(
-            ax_ecg, seg_hm_sel, window, stride, sampling_rate,
+            ax_ecg, seg_hm_shade, window, stride, sampling_rate,
             shade_color=shade_color, signal_len=Lsig, half_signal=half_ecg,
+            draw_bbox=use_full_12, per_lead=use_full_12, row_height=row_height,
         )
-        n_leads_str = f"{len(lead_indices)}-lead" if len(lead_indices) != 12 else "12-lead"
-        ax_ecg.set_title(f"{n_leads_str} ECG (shaded = IMN important regions)", fontsize=8)
+        if use_full_12:
+            ax_ecg.set_title(f"{tag} | P({pos_class_name})={prob:.3f} | idx={idx} | ★=top-k leads, boxed=top-k segments per lead", fontsize=8)
+        else:
+            n_leads_str = f"{len(lead_indices)}-lead" if len(lead_indices) != 12 else "12-lead"
+            shade_str = "top-k segments per lead" if top_seg_per_lead else "IMN important regions"
+            ax_ecg.set_title(f"{n_leads_str} ECG (shaded = {shade_str})", fontsize=8)
 
         fig.tight_layout(pad=0.5)
         sample_path = os.path.join(out_dir, f"{base_name}_{tag}_{idx:04d}.pdf")
@@ -998,6 +1169,18 @@ def main():
         default=None,
         help="Height ratio for the bottom ECG/lead traces panel. Lower = shorter. "
              "Default: 0.65 per lead for IMN viz, 1.4 for ECG+heatmap viz.",
+    )
+    parser.add_argument(
+        "--top_k_leads",
+        type=int,
+        default=None,
+        help="Visualize only the top-k most important leads per sample (based on mean |impact|).",
+    )
+    parser.add_argument(
+        "--top_k_segments",
+        type=int,
+        default=None,
+        help="Visualize only the top-k most important segments per sample (based on max importance over leads).",
     )
 
     args = parser.parse_args()
@@ -1207,6 +1390,8 @@ def main():
             lead_indices=lead_indices,
             heatmap_height=heatmap_h,
             ecg_height=ecg_h,
+            top_k_leads=args.top_k_leads,
+            top_k_segments=args.top_k_segments,
         )
 
     # ECG plot visualization with IMN heatmap (PDF format)
@@ -1232,6 +1417,8 @@ def main():
             lead_indices=lead_indices,
             heatmap_height=heatmap_h_ecg,
             ecg_height=ecg_h_ecg,
+            top_k_leads=args.top_k_leads,
+            top_k_segments=args.top_k_segments,
         )
 
     print("Done.")

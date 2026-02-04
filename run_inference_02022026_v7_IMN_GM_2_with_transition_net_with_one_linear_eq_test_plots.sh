@@ -15,7 +15,7 @@ export CUDA_VISIBLE_DEVICES=0
 #      bash run_inference_...sh 250 125
 
 TASKS=(norm_vs_mi norm_vs_sttc norm_vs_cd norm_vs_hyp)
-RATES=(100 500)
+RATES=(500)
 BASE_OUT="runs/imn_ecg_transition_net_GM_one_linear"
 
 DATA_PATH="/work/vajira/DATA/EXG_PTB_XL/physionet/files/ptb-xl/1_0_1"
@@ -25,8 +25,8 @@ DATA_PATH="/work/vajira/DATA/EXG_PTB_XL/physionet/files/ptb-xl/1_0_1"
 #   leads: e.g. "V1,V2,V3,V4,V5,V6" or "0-5" or "I,II,III"
 #   heatmap_height: e.g. 0.3 (shorter) or 0.8 (taller) for top heatmap panel
 #   ecg_height: e.g. 0.5 (shorter) or 1.0 (taller) for bottom ECG/lead traces panel
-WINDOW_ARG="--window 125"
-STRIDE_ARG="--stride 67"
+WINDOW_ARG="--window 10"
+STRIDE_ARG="--stride 5"
 LEADS_ARG="--leads I,V2,V3"
 HEATMAP_HEIGHT_ARG="--viz_heatmap_height 0.3"
 ECG_HEIGHT_ARG="--viz_ecg_height 0.3"
