@@ -12,9 +12,14 @@ SCRIPT="script_02022026_v7_IMN_GM_2_with_transition_net_with_one_linear_eq.py"
 DATA_PATH="/work/vajira/DATA/EXG_PTB_XL/physionet/files/ptb-xl/1_0_1"
 BASE_OUT="runs/imn_ecg_transition_net_GM_one_linear"
 
-# Top-k for leads and segments (per-sample, based on IMN impact importance)
-TOP_K_LEADS="${1:-2}"      # Default: top 4 leads
-TOP_K_SEGMENTS="${2:-2}"  # Default: top 10 segments
+# Top-k for leads and segments (per-sample, based on IMN impact **signed** contribution
+# to the positive logit, matching the Gradio app semantics).
+#   - TOP_K_LEADS: how many leads with the strongest positive evidence for the
+#                  positive class to highlight per sample.
+#   - TOP_K_SEGMENTS: how many time segments (per lead) with the strongest
+#                     positive evidence to highlight per sample.
+TOP_K_LEADS="${1:-2}"      # Default: top 2 leads
+TOP_K_SEGMENTS="${2:-2}"   # Default: top 2 segments per lead
 
 # Window/stride for segment aggregation (100 Hz typical: w=10, s=5)
 WINDOW="${3:-50}"
@@ -74,7 +79,7 @@ for task in "${TASKS[@]}"; do
     --viz_pdf "viz_${task}_top${TOP_K_LEADS}leads_top${TOP_K_SEGMENTS}seg_inference.pdf" \
     --wandb_project mesormorphic_ecg \
     --viz_ecg_plot \
-    --viz_ecg_plot_n 3
+    --viz_ecg_plot_n 3 
 
   echo "  Done: ${task}"
 done
