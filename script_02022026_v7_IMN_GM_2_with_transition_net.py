@@ -397,6 +397,43 @@ def simple_auc_roc(y_true: torch.Tensor, y_score: torch.Tensor) -> float:
 # -----------------------
 # Visualization Helpers (Intrinsic IMN)
 # -----------------------
+DEFAULT_LEAD_NAMES = ["I", "II", "III", "aVR", "aVL", "aVF", "V1", "V2", "V3", "V4", "V5", "V6"]
+
+
+def parse_lead_indices(leads_str: str | None, lead_names: list | None = None) -> list[int] | None:
+    """
+    Parse lead selection string into list of 0-based indices.
+    Examples: "0,1,2,3" "I,II,III,V1" "0-5" "V1,V2,V3,V4,V5,V6"
+    Returns None if leads_str is None/empty (meaning all leads).
+    """
+    if not leads_str or not str(leads_str).strip():
+        return None
+    lead_names = lead_names or DEFAULT_LEAD_NAMES
+    name_to_idx = {n.upper(): i for i, n in enumerate(lead_names)}
+    name_to_idx.update({n: i for i, n in enumerate(lead_names)})
+    result = []
+    for part in str(leads_str).replace(" ", "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        if "-" in part and not part.startswith("-"):
+            lo, hi = part.split("-", 1)
+            try:
+                lo_i, hi_i = int(lo.strip()), int(hi.strip())
+                result.extend(range(lo_i, hi_i + 1))
+            except ValueError:
+                pass
+        elif part.upper() in name_to_idx:
+            result.append(name_to_idx[part.upper()])
+        else:
+            try:
+                result.append(int(part))
+            except ValueError:
+                if part.upper() in name_to_idx:
+                    result.append(name_to_idx[part.upper()])
+    return sorted(set(i for i in result if 0 <= i < 12)) if result else None
+
+
 def imn_weights_to_segments(impact_12L: np.ndarray, window: int, stride: int) -> np.ndarray:
     """
     Aggregates point-wise feature attribution (Impact) into segments for cleaner visualization.
@@ -424,7 +461,10 @@ def visualize_imn_to_pdf(model, dataset, device, pdf_path: str,
                          pos_class_name: str = "MI",
                          random_pick: bool = False, seed: int = 123,
                          lead_names=None, lambda_l1: float = 1e-4,
-                         viz_negative_class: bool = False):
+                         viz_negative_class: bool = False,
+                         lead_indices: list[int] | None = None,
+                         heatmap_height: float = 1.0,
+                         ecg_height: float = 0.65):
     """
     Visualizes IMN Feature Attributions.
     Calculation: Impact = w(x) * x
@@ -434,7 +474,9 @@ def visualize_imn_to_pdf(model, dataset, device, pdf_path: str,
     """
     model.eval()
     if lead_names is None:
-        lead_names = ["I","II","III","aVR","aVL","aVF","V1","V2","V3","V4","V5","V6"]
+        lead_names = list(DEFAULT_LEAD_NAMES)
+    lead_indices = lead_indices if lead_indices is not None else list(range(12))
+    n_leads = len(lead_indices)
         
     os.makedirs(os.path.dirname(pdf_path) or ".", exist_ok=True)
     
@@ -492,32 +534,34 @@ def visualize_imn_to_pdf(model, dataset, device, pdf_path: str,
             shade_color = "blue" if use_neg_class else "red"
             weight_label = "NORM" if use_neg_class else pos_class_name
 
-            # Plotting
-            fig = plt.figure(figsize=(11.7, 16.5))
-            gs = fig.add_gridspec(14, 1, height_ratios=[2] + [1]*12 + [0.5])
+            # Plotting: minimal hspace to attach lead subplots, compact lead heights
+            fig = plt.figure(figsize=(11.7, max(8, heatmap_height + n_leads * ecg_height)))
+            gs = fig.add_gridspec(n_leads + 2, 1, height_ratios=[heatmap_height] + [ecg_height] * n_leads + [0.4], hspace=0.01)
 
-            # Heatmap Top
+            # Heatmap Top (subset of leads)
+            seg_hm_sel = seg_hm[lead_indices]
             ax0 = fig.add_subplot(gs[0, 0])
-            im = ax0.imshow(seg_hm, aspect="auto", vmin=0, vmax=1, cmap=cmap)
-            ax0.set_yticks(range(12))
-            ax0.set_yticklabels(lead_names)
+            im = ax0.imshow(seg_hm_sel, aspect="auto", vmin=0, vmax=1, cmap=cmap)
+            ax0.set_yticks(range(n_leads))
+            ax0.set_yticklabels([lead_names[i] for i in lead_indices])
             ax0.set_xlabel(f"Segments (window={window}, stride={stride}, fs={sampling_rate}Hz)")
             prob_str = f"P({pos_class_name})={prob_pos:.3f}" if not use_neg_class else f"P(NORM)={prob_neg:.3f}"
             ax0.set_title(f"IMN Intrinsic Explanation | {tag} | True={y_int} | {prob_str} | Weights={weight_label} | idx={idx}")
             fig.colorbar(im, ax=ax0, fraction=0.02, pad=0.01)
 
-            # Signal traces with shading
-            for lead in range(12):
-                ax = fig.add_subplot(gs[lead + 1, 0])
+            # Signal traces with shading (tight spacing between leads)
+            for k, lead in enumerate(lead_indices):
+                ax = fig.add_subplot(gs[k + 1, 0])
                 ax.plot(x_np[lead], linewidth=0.8, color='black', alpha=0.6)
                 ax.set_xlim(0, Lsig - 1)
-                ax.set_ylabel(lead_names[lead], rotation=0, labelpad=20, va="center")
+                ax.set_ylabel(lead_names[lead], rotation=0, labelpad=8, va="center", fontsize=8)
+                ax.set_yticklabels([])
+                ax.margins(y=0.02)
                 
                 # Shade based on aggregated segment importance
                 contrib = seg_hm[lead]
                 for t in range(Tseg):
                     a = float(contrib[t])
-                    # Thresholding to avoid clutter
                     alpha = min(0.5, a * 0.6)
                     if alpha > 0.05:
                         start = t * stride
@@ -527,15 +571,15 @@ def visualize_imn_to_pdf(model, dataset, device, pdf_path: str,
                 ax.set_xticks([])
 
             # Footer
-            axf = fig.add_subplot(gs[13, 0])
+            axf = fig.add_subplot(gs[n_leads + 1, 0])
             axf.axis("off")
             footer_text = f"IMN Feature Attribution: $|w(x) \cdot x|$ aggregated by segment. L1 Reg={lambda_l1}"
             if use_neg_class:
                 footer_text += " | Showing NORM (class 0) weights."
             axf.text(0, 0.5, footer_text, fontsize=10)
 
-            fig.tight_layout()
-            pdf.savefig(fig)
+            fig.tight_layout(pad=0.3)
+            pdf.savefig(fig, bbox_inches="tight", pad_inches=0.05)
             plt.close(fig)
 
 
@@ -610,11 +654,34 @@ def main():
     parser.add_argument("--viz_random", action="store_true")
     parser.add_argument("--viz_negative_class", action="store_true",
                         help="For NORM samples, visualize class 0 (NORM) weights instead of class 1 (positive) weights.")
+    parser.add_argument(
+        "--leads",
+        type=str,
+        default=None,
+        help="Leads to visualize: comma-separated indices (0-11) or names (I,II,III,aVR,aVL,aVF,V1-V6). "
+             "E.g. '0,1,2' or 'I,II,III' or 'V1,V2,V3,V4,V5,V6' or '0-5'. Default: all 12 leads.",
+    )
+    parser.add_argument(
+        "--viz_heatmap_height",
+        type=float,
+        default=None,
+        help="Height ratio for the top heatmap panel. Lower = shorter heatmap. Default: 1.0.",
+    )
+    parser.add_argument(
+        "--viz_ecg_height",
+        type=float,
+        default=None,
+        help="Height ratio for the bottom ECG/lead traces panel. Lower = shorter. Default: 0.65 per lead.",
+    )
 
     args = parser.parse_args()
 
     if args.inference_only and not args.ckpt:
         parser.error("--ckpt is required when --inference_only")
+
+    lead_indices = parse_lead_indices(args.leads)
+    if lead_indices is not None:
+        print(f"Visualizing leads: {lead_indices} ({[DEFAULT_LEAD_NAMES[i] for i in lead_indices]})")
 
     set_seed(args.seed)
 
@@ -804,6 +871,8 @@ def main():
         pdf_path = pdf_name if os.path.isabs(pdf_name) else os.path.join(run_dir, pdf_name)
 
         print(f"Generating IMN explanations (window={viz_window}, stride={viz_stride}) to {pdf_path}...")
+        heatmap_h = args.viz_heatmap_height if args.viz_heatmap_height is not None else 1.0
+        ecg_h = args.viz_ecg_height if args.viz_ecg_height is not None else 0.65
         visualize_imn_to_pdf(
             model=lit.model,
             dataset=val_ds,
@@ -818,7 +887,10 @@ def main():
             random_pick=args.viz_random,
             seed=123,
             lambda_l1=args.lambda_l1,
-            viz_negative_class=args.viz_negative_class
+            viz_negative_class=args.viz_negative_class,
+            lead_indices=lead_indices,
+            heatmap_height=heatmap_h,
+            ecg_height=ecg_h,
         )
     print("Done.")
 
