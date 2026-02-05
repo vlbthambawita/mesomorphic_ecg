@@ -10,6 +10,9 @@ runs/
 # Visualizations
 visualizations/
 
+# Test fold 10 data
+testfold10_npz/
+
 # Common Python/ML ignores
 __pycache__/
 *.py[cod]
