@@ -1,7 +1,0 @@
-Use the following experiment to paper:
-
-script_25012026_v3_Selected_01_lightning_save_wgen_tokens.py - Original Model
-script_28012026_v8_Selected_01_lightning_save_wgen_token.py - Updated model
-
-Base LIne Models:
-script_30012026_baseline_v3_related.py - own 1D GradCam visualization, same model as script_25012026_v3_Selected_01_lightning_save_wgen_tokens.py
