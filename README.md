@@ -17,9 +17,13 @@ This project provides **Interpretable Mesomorphic Networks (IMN)** and a **2D CN
 | **IMN v2 (transition, 2-class CE)** | Transition net, 100 Hz | `scripts/train_imn_v2_ce.sh` | `scripts/infer_imn_v2_ce.sh` |
 | **IMN v2 (transition, single linear)** | BCE, 100 & 500 Hz | `scripts/train_imn_v2_one_linear.sh` | `scripts/infer_imn_v2_one_linear.sh` |
 
-### Pre-trained checkpoints
+### Pre-trained checkpoints & demo
 
 [![Hugging Face](https://huggingface.co/front/assets/huggingface_logo-noborder.svg)](https://huggingface.co/SEARCH-IHI/mesomorphicECG) [**Model on Hugging Face**](https://huggingface.co/SEARCH-IHI/mesomorphicECG)
+
+[![Space - MesomorphicECG XAI](https://img.shields.io/badge/Space-MesomorphicECG__XAI-yellow)](https://huggingface.co/spaces/SEARCH-IHI/mesomorphicECG_XAI)
+
+An interactive XAI demo is available as a Hugging Face Space: [**MesomorphicECG XAI**](https://huggingface.co/spaces/SEARCH-IHI/mesomorphicECG_XAI).
 
 Pre-trained IMN checkpoints are available on [Hugging Face](https://huggingface.co/SEARCH-IHI/mesomorphicECG). Download a checkpoint and pass it to the inference scripts via `--ckpt`, or place it in the expected run directory so the inference scripts auto-detect it.
 
