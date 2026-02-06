@@ -1,3 +1,9 @@
+<p align="center">
+  <img src="https://img.shields.io/badge/python-3.9%2B-blue.svg" />
+  <img src="https://img.shields.io/badge/PyTorch-%3E=2.0-EE4C2C.svg" />
+  <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-lightgrey.svg" />
+</p>
+
 ## Quickstart: PTB-XL NORM vs X (Train / Inference / Plots)
 
 This project provides **Interpretable Mesomorphic Networks (IMN)** and a **2D CNN + Grad-CAM baseline** for binary ECG classification (NORM vs MI, STTC, CD, HYP) on PTB-XL. All scripts run from the project root.
