@@ -580,6 +580,104 @@ def visualize_imn_to_pdf(model, dataset, device, pdf_path: str,
             plt.close(fig)
 
 
+def visualize_imn_w_used_to_pdf(model, dataset, device, pdf_path: str,
+                                 sampling_rate: int, window: int, stride: int,
+                                 n_pos: int, n_neg: int,
+                                 pos_class_name: str = "MI",
+                                 random_pick: bool = False, seed: int = 123,
+                                 lead_names=None, lambda_l1: float = 1e-4,
+                                 viz_negative_class: bool = False,
+                                 lead_indices: list[int] | None = None,
+                                 heatmap_height: float = 1.0,
+                                 ecg_height: float = 0.65):
+    """
+    Visualizes IMN generated weights (w_used) only, without multiplying by input.
+    Same layout as visualize_imn_to_pdf but heatmap shows |w| instead of |w * x|.
+    """
+    model.eval()
+    if lead_names is None:
+        lead_names = list(DEFAULT_LEAD_NAMES)
+    lead_indices = lead_indices if lead_indices is not None else list(range(12))
+    n_leads = len(lead_indices)
+
+    os.makedirs(os.path.dirname(pdf_path) or ".", exist_ok=True)
+
+    pos_idx, neg_idx = [], []
+    for i in range(len(dataset)):
+        _, y = dataset[i]
+        if int(y.item()) == 1:
+            pos_idx.append(i)
+        else:
+            neg_idx.append(i)
+
+    if random_pick:
+        rng = np.random.default_rng(seed)
+        rng.shuffle(pos_idx)
+        rng.shuffle(neg_idx)
+
+    sel_pos = pos_idx[:n_pos]
+    sel_neg = neg_idx[:n_neg]
+    selected = [(pos_class_name, i) for i in sel_pos] + [("NORM", i) for i in sel_neg]
+
+    with PdfPages(pdf_path) as pdf:
+        for tag, idx in selected:
+            x, y = dataset[idx]
+            y_int = int(y.item())
+            x_b = x.unsqueeze(0).to(device)
+
+            with torch.no_grad():
+                logits, gen_w, gen_b = model(x_b)
+                prob = float(torch.sigmoid(logits)[0, 0].item())
+                w_used = gen_w[0, 0, :, :].cpu().numpy()
+
+            x_np = x.numpy()
+            seg_hm = imn_weights_to_segments(w_used, window=window, stride=stride)
+            Tseg = seg_hm.shape[1]
+            Lsig = x.shape[1]
+
+            is_norm_sample = (tag == "NORM")
+            cmap = "Blues" if is_norm_sample else "Reds"
+            shade_color = "blue" if is_norm_sample else "red"
+
+            fig = plt.figure(figsize=(11.7, max(8, heatmap_height + n_leads * ecg_height)))
+            gs = fig.add_gridspec(n_leads + 2, 1, height_ratios=[heatmap_height] + [ecg_height] * n_leads + [0.4], hspace=0.01)
+
+            seg_hm_sel = seg_hm[lead_indices]
+            ax0 = fig.add_subplot(gs[0, 0])
+            im = ax0.imshow(seg_hm_sel, aspect="auto", vmin=0, vmax=1, cmap=cmap)
+            ax0.set_yticks(range(n_leads))
+            ax0.set_yticklabels([lead_names[i] for i in lead_indices])
+            ax0.set_xlabel(f"Segments (window={window}, stride={stride}, fs={sampling_rate}Hz)")
+            title_prob = f"P({pos_class_name})={prob:.3f}"
+            ax0.set_title(f"IMN Generated Weights |w| (Single Linear) | {tag} | True={y_int} | {title_prob} | idx={idx}")
+            fig.colorbar(im, ax=ax0, fraction=0.02, pad=0.01)
+
+            for k, lead in enumerate(lead_indices):
+                ax = fig.add_subplot(gs[k + 1, 0])
+                ax.plot(x_np[lead], linewidth=0.8, color="black", alpha=0.6)
+                ax.set_xlim(0, Lsig - 1)
+                ax.set_ylabel(lead_names[lead], rotation=0, labelpad=8, va="center", fontsize=8)
+                ax.set_yticklabels([])
+                ax.margins(y=0.02)
+                contrib = seg_hm[lead]
+                for t in range(Tseg):
+                    a = float(contrib[t])
+                    alpha = min(0.5, a * 0.6)
+                    if alpha > 0.05:
+                        start = t * stride
+                        end = min(start + window, Lsig)
+                        ax.axvspan(start, end, alpha=alpha, color=shade_color, linewidth=0)
+                ax.set_xticks([])
+
+            axf = fig.add_subplot(gs[n_leads + 1, 0])
+            axf.axis("off")
+            axf.text(0, 0.5, f"IMN Generated Weights: |w|. Single Linear Function. L1 Reg={lambda_l1}", fontsize=10)
+
+            fig.tight_layout(pad=0.3)
+            pdf.savefig(fig, bbox_inches="tight", pad_inches=0.05)
+            plt.close(fig)
+
+
 # -----------------------
 # ECG Plot Visualization (ecg_plot library)
 # -----------------------
@@ -902,6 +1000,107 @@ def visualize_ecg_with_imn_heatmap_to_pdf(
     print(f"Saved {len(saved_paths)} ECG+IMN heatmap PDFs to {out_dir}")
 
 
+def visualize_ecg_with_imn_w_used_heatmap_to_pdf(
+    model,
+    dataset,
+    device,
+    pdf_path: str,
+    sampling_rate: int,
+    window: int,
+    stride: int,
+    n_samples: int = 5,
+    pos_class_name: str = "MI",
+    random_pick: bool = False,
+    seed: int = 42,
+    lead_names: list | None = None,
+    lambda_l1: float = 1e-4,
+    half_ecg: bool = True,
+    row_height: float = 0.5,
+    lead_indices: list[int] | None = None,
+    heatmap_height: float = 0.5,
+    ecg_height: float = 1.4,
+) -> None:
+    """
+    Visualize ECG with IMN w_used heatmap on top. Same as visualize_ecg_with_imn_heatmap_to_pdf
+    but uses generated weights |w| instead of impact |w * x|.
+    """
+    model.eval()
+    if lead_names is None:
+        lead_names = list(DEFAULT_LEAD_NAMES)
+    lead_indices = lead_indices if lead_indices is not None else list(range(12))
+
+    out_dir = os.path.dirname(pdf_path) or "."
+    os.makedirs(out_dir, exist_ok=True)
+    base_name = os.path.splitext(os.path.basename(pdf_path))[0]
+
+    N = len(dataset)
+    n_plot = min(n_samples, N)
+    if random_pick:
+        rng = np.random.default_rng(seed)
+        indices = rng.choice(N, size=n_plot, replace=False)
+    else:
+        indices = np.arange(n_plot)
+
+    saved_paths = []
+    for idx in indices:
+        x, y = dataset[idx]
+        y_int = int(y.item())
+        tag = pos_class_name if y_int == 1 else "NORM"
+        x_b = x.unsqueeze(0).to(device)
+
+        with torch.no_grad():
+            logits, gen_w, _ = model(x_b)
+            prob = float(torch.sigmoid(logits)[0, 0].item())
+            w_used = gen_w[0, 0, :, :].cpu().numpy()
+
+        x_np = x.numpy()
+        seg_hm = imn_weights_to_segments(w_used, window=window, stride=stride)
+        Lsig = x.shape[1]
+
+        if half_ecg:
+            n_seg_half = max(1, (Lsig // 2 - window) // stride + 1)
+            seg_hm = seg_hm[:, :n_seg_half]
+
+        x_np_sel = x_np[lead_indices]
+        seg_hm_sel = seg_hm[lead_indices]
+        lead_names_sel = [lead_names[i] for i in lead_indices]
+
+        is_norm_sample = tag == "NORM"
+        cmap = "Blues" if is_norm_sample else "Reds"
+        shade_color = "blue" if is_norm_sample else "red"
+
+        fig = plt.figure(figsize=(7, 5.2))
+        gs = fig.add_gridspec(2, 1, height_ratios=[heatmap_height, ecg_height], hspace=0.1)
+
+        ax_hm = fig.add_subplot(gs[0, 0])
+        im = ax_hm.imshow(seg_hm_sel, aspect="auto", vmin=0, vmax=1, cmap=cmap)
+        ax_hm.set_yticks(range(len(lead_indices)))
+        ax_hm.set_yticklabels(lead_names_sel, fontsize=7)
+        ax_hm.set_xlabel(f"Segments (w={window}, s={stride}, fs={sampling_rate}Hz)", fontsize=8)
+        ax_hm.set_title(f"IMN |w| Heatmap | {tag} | P({pos_class_name})={prob:.3f} | idx={idx}", fontsize=9)
+        fig.colorbar(im, ax=ax_hm, fraction=0.02, pad=0.02, shrink=0.8)
+
+        ax_ecg = fig.add_subplot(gs[1, 0])
+        _draw_ecg_plot_style(
+            ax_ecg, x_np_sel, sampling_rate, lead_names_sel,
+            columns=2, row_height=row_height, half_signal=half_ecg,
+        )
+        _draw_important_patches_on_ecg(
+            ax_ecg, seg_hm_sel, window, stride, sampling_rate,
+            shade_color=shade_color, signal_len=Lsig, half_signal=half_ecg,
+        )
+        n_leads_str = f"{len(lead_indices)}-lead" if len(lead_indices) != 12 else "12-lead"
+        ax_ecg.set_title(f"{n_leads_str} ECG (shaded = IMN |w| important regions)", fontsize=8)
+
+        fig.tight_layout(pad=0.5)
+        sample_path = os.path.join(out_dir, f"{base_name}_{tag}_{idx:04d}.pdf")
+        fig.savefig(sample_path, bbox_inches="tight", pad_inches=0.08)
+        saved_paths.append(sample_path)
+        plt.close(fig)
+
+    print(f"Saved {len(saved_paths)} ECG+IMN |w| heatmap PDFs to {out_dir}")
+
+
 # -----------------------
 # Main
 # -----------------------
@@ -967,6 +1166,8 @@ def main():
                         help="Visualize ECG samples using ecg_plot library (pip install ecg_plot).")
     parser.add_argument("--viz_ecg_plot_n", type=int, default=5,
                         help="Number of ECG samples to plot with ecg_plot when --viz_ecg_plot.")
+    parser.add_argument("--viz_w_used", action="store_true",
+                        help="Also generate plots using generated weights |w| only (instead of impact |w*x|).")
     # Reserved CLI flags for ECG+IMN plots (half-length ECG and one sample per file are defaults).
     parser.add_argument(
         "--half_ecg",
@@ -1209,6 +1410,30 @@ def main():
             ecg_height=ecg_h,
         )
 
+        if args.viz_w_used:
+            w_used_pdf_name = f"{base_name}_w_used_w{viz_window}_s{viz_stride}{ext}" if len(viz_pairs) > 1 else f"{base_name}_w_used{ext}"
+            w_used_pdf_path = w_used_pdf_name if os.path.isabs(w_used_pdf_name) else os.path.join(run_dir, w_used_pdf_name)
+            print(f"Generating IMN |w| explanations (window={viz_window}, stride={viz_stride}) to {w_used_pdf_path}...")
+            visualize_imn_w_used_to_pdf(
+                model=lit.model,
+                dataset=val_ds,
+                device=model_device,
+                pdf_path=w_used_pdf_path,
+                sampling_rate=args.sampling_rate,
+                window=viz_window,
+                stride=viz_stride,
+                n_pos=args.n_pos_viz,
+                n_neg=args.n_neg_viz,
+                pos_class_name=pos_class,
+                random_pick=args.viz_random,
+                seed=123,
+                lambda_l1=args.lambda_l1,
+                viz_negative_class=args.viz_negative_class,
+                lead_indices=lead_indices,
+                heatmap_height=heatmap_h,
+                ecg_height=ecg_h,
+            )
+
     # ECG plot visualization with IMN heatmap (PDF format)
     if args.viz_ecg_plot:
         viz_window, viz_stride = viz_pairs[0] if viz_pairs else (default_window, default_window // 2)
@@ -1221,6 +1446,31 @@ def main():
             dataset=val_ds,
             device=model_device,
             pdf_path=ecg_pdf_path,
+            sampling_rate=args.sampling_rate,
+            window=viz_window,
+            stride=viz_stride,
+            n_samples=args.viz_ecg_plot_n,
+            pos_class_name=pos_class,
+            random_pick=args.viz_random,
+            seed=args.seed,
+            lambda_l1=args.lambda_l1,
+            lead_indices=lead_indices,
+            heatmap_height=heatmap_h_ecg,
+            ecg_height=ecg_h_ecg,
+        )
+
+    # ECG + IMN |w| heatmap (when --viz_w_used)
+    if args.viz_w_used:
+        viz_window, viz_stride = viz_pairs[0] if viz_pairs else (default_window, default_window // 2)
+        ecg_w_used_pdf_path = os.path.join(run_dir, "ecg_with_imn_w_used_heatmap.pdf")
+        print(f"Generating ECG+IMN |w| heatmap PDF to {ecg_w_used_pdf_path}...")
+        heatmap_h_ecg = args.viz_heatmap_height if args.viz_heatmap_height is not None else 0.5
+        ecg_h_ecg = args.viz_ecg_height if args.viz_ecg_height is not None else 1.4
+        visualize_ecg_with_imn_w_used_heatmap_to_pdf(
+            model=lit.model,
+            dataset=val_ds,
+            device=model_device,
+            pdf_path=ecg_w_used_pdf_path,
             sampling_rate=args.sampling_rate,
             window=viz_window,
             stride=viz_stride,

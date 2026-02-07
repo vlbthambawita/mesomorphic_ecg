@@ -11,12 +11,12 @@ PROJECT_ROOT="$(cd "$SCRIPT_DIR/.." && pwd)"
 cd "$PROJECT_ROOT"
 
 TASKS=(norm_vs_mi norm_vs_sttc norm_vs_cd norm_vs_hyp)
-RATES=(100 500)
+RATES=(100)
 BASE_OUT="runs/imn_ecg_transition_net_GM_one_linear"
 DATA_PATH="/work/vajira/DATA/EXG_PTB_XL/physionet/files/ptb-xl/1_0_1"
 
-WINDOW_ARG="--window 125"
-STRIDE_ARG="--stride 67"
+WINDOW_ARG="--window 2"
+STRIDE_ARG="--stride 1"
 LEADS_ARG="--leads I,V2,V3"
 HEATMAP_HEIGHT_ARG="--viz_heatmap_height 0.3"
 ECG_HEIGHT_ARG="--viz_ecg_height 0.3"
@@ -41,7 +41,7 @@ for rate in "${RATES[@]}"; do
       --lambda_l1 1e-4 --scheduler none --inference_only --ckpt "${CKPT_PATH}" \
       --n_pos_viz 10 --n_neg_viz 10 ${WINDOW_ARG} ${STRIDE_ARG} --viz_random \
       --viz_pdf "viz_${task}_imn_inference.pdf" --wandb_project mesormorphic_ecg \
-      --one_per_file ${LEADS_ARG} ${HEATMAP_HEIGHT_ARG} ${ECG_HEIGHT_ARG}
+      --viz_w_used --one_per_file ${LEADS_ARG} ${HEATMAP_HEIGHT_ARG} ${ECG_HEIGHT_ARG}
     echo "========== Finished inference for task: ${task} @ ${rate} Hz =========="
   done
 done
