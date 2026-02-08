@@ -102,7 +102,13 @@ bash scripts/infer_imn_v2_one_linear_ecgplots.sh 125 67 "I,V2,V3" 0.3 0.3
 
 ### Authors
 
-SEARCH-IHI – Synthetic Healthcare Data Governance Hub
+- [Vajira Thambawita](https://orcid.org/0000-0001-6026-0929)<sup>1</sup>
+- [Jonas L. Isaksen](https://orcid.org/0000-0003-3227-1131)<sup>2</sup>
+- [Jørgen K. Kanters](https://orcid.org/0000-0002-3267-4910)<sup>2</sup>
+- [Hugo L. Hammer](https://orcid.org/0000-0001-9429-7148)<sup>3</sup>
+- [Pål Halvorsen](https://orcid.org/0000-0003-2073-7029)<sup>1</sup>
+
+<sup>1</sup> SimulaMet, Oslo, Norway — <sup>2</sup> University of Copenhagen, Copenhagen, Denmark — <sup>3</sup> Oslo Metropolitan University, Oslo, Norway
 
 ### Citation
 
