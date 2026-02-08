@@ -8,76 +8,77 @@ The hypernetwork extracts latent features and generates **instance-specific weig
 ## 🧠 Model Architecture
 
 ```mermaid
-flowchart TD
-    %% Define styles
-    classDef input fill:#e1f5fe,stroke:#01579b,stroke-width:2px;
-    classDef layer fill:#f3e5f5,stroke:#4a148c,stroke-width:2px;
-    classDef tensor fill:#fff9c4,stroke:#fbc02d,stroke-width:1px,stroke-dasharray:5\,5;
-    classDef param fill:#e0f2f1,stroke:#00695c,stroke-width:2px;
-    classDef output fill:#ffebee,stroke:#c62828,stroke-width:2px;
+%%{init: {'theme': 'base', 'themeVariables': { 'primaryColor': '#fff', 'primaryTextColor': '#333', 'primaryBorderColor': '#333', 'lineColor': '#555', 'secondaryColor': '#f0f0f0', 'tertiaryColor': '#fff'}}}%%
+flowchart TB
+    %% Color palette: Blue (input), Purple (layers), Amber (tensors), Teal (params), Coral (output)
+    classDef input fill:#42A5F5,stroke:#1565C0,stroke-width:2px,color:#fff;
+    classDef layer fill:#7E57C2,stroke:#4A148C,stroke-width:2px,color:#fff;
+    classDef tensor fill:#FFB74D,stroke:#E65100,stroke-width:2px,color:#1a1a1a;
+    classDef param fill:#26A69A,stroke:#00695C,stroke-width:2px,color:#fff;
+    classDef output fill:#EF5350,stroke:#B71C1C,stroke-width:2px,color:#fff;
 
     %% Input
     Input[("Input Signal x<br>(B, 12, L)")]:::input
-    
-    %% Expand dim
     ExpInput["Unsqueeze(1)<br>(B, 1, 12, L)"]:::tensor
     Input --> ExpInput
 
-    %% ENCODER / BACKBONE
+    %% ENCODER – compact horizontal layout
     subgraph Encoder ["Hypernetwork Backbone (Feature Extraction)"]
-        Conv1["Conv1 + BN + GELU<br>kernel=(3,15)"]:::layer
-        Feat1["(B, 16, 12, L)"]:::tensor
-        
-        Conv2["Conv2 + BN + GELU + MaxPool(1,2)<br>kernel=(3,15)"]:::layer
-        Feat2["(B, 32, 12, L/2)"]:::tensor
-        
-        Conv3["Conv3 + BN + GELU + MaxPool(1,2)<br>kernel=(3,15)"]:::layer
-        Feat3["Latent Features<br>(B, 64, 12, L/4)"]:::tensor
-        
+        direction LR
+        Conv1["Conv1+BN+GELU"]:::layer
+        Feat1["(16,L)"]:::tensor
+        Conv2["Conv2+Pool"]:::layer
+        Feat2["(32,L/2)"]:::tensor
+        Conv3["Conv3+Pool"]:::layer
+        Feat3["Latent<br>(64,L/4)"]:::tensor
         ExpInput --> Conv1 --> Feat1 --> Conv2 --> Feat2 --> Conv3 --> Feat3
     end
 
-    %% BRANCH 1: WEIGHTS
+    %% BRANCH 1: WEIGHTS – compact horizontal
     subgraph Transition ["Transition Network (Weight Generation)"]
-        Trans1["Conv(64→32) + Upsample(1,2)"]:::layer
-        TFeat1["(B, 32, 12, L/2)"]:::tensor
-        
-        Trans2["Conv(32→16) + Upsample(1,2)"]:::layer
-        TFeat2["(B, 16, 12, L)"]:::tensor
-        
-        TransHead["Conv(16→K)<br>Linear Projection"]:::layer
-        GenW[("Generated Weights W<br>(B, K, 12, L)")]:::param
-        
-        Feat3 --> Trans1 --> TFeat1 --> Trans2 --> TFeat2 --> TransHead --> GenW
+        direction LR
+        Trans1["Conv+Up"]:::layer
+        Trans2["Conv+Up"]:::layer
+        TransHead["Conv→K"]:::layer
+        GenW[("Weights W<br>(B,K,12,L)")]:::param
+        Feat3 --> Trans1 --> Trans2 --> TransHead --> GenW
     end
 
-    %% BRANCH 2: BIAS
+    %% BRANCH 2: BIAS – compact horizontal
     subgraph BiasGen ["Bias Generator"]
-        Pool["AdaptiveAvgPool(1,1)"]:::layer
-        BFeat["(B, 64, 1, 1) → (B, 64)"]:::tensor
-        
-        LinearB["Linear(64 → K)"]:::layer
-        GenB[("Generated Bias b<br>(B, K)")]:::param
-        
-        Feat3 --> Pool --> BFeat --> LinearB --> GenB
+        direction LR
+        Pool["AvgPool"]:::layer
+        LinearB["Linear(64→K)"]:::layer
+        GenB[("Bias b<br>(B,K)")]:::param
+        Feat3 --> Pool --> LinearB --> GenB
     end
 
-    %% LOCAL LINEAR MODEL
-    subgraph Application ["Local Linear Model Application"]
-        InputRef["Input x (Ref)<br>(B, 1, 12, L)"]:::input
+    %% LOCAL LINEAR MODEL – compact horizontal
+    subgraph Application ["Local Linear Model"]
+        direction LR
+        InputRef["x (Ref)"]:::input
+        DotProd["W ⊙ x"]:::layer
+        Sum["Sum"]:::layer
+        AddBias["+ b"]:::output
+        Logits[("Logits<br>(B,K)")]:::output
         Input -.-> InputRef
-        
-        DotProd["Element-wise Multiply<br>(W ⊙ x)"]:::layer
-        Weighted["Weighted Input<br>(B, K, 12, L)"]:::tensor
-        
-        Sum["Sum over dims (2,3)<br>(Leads & Time)"]:::layer
-        LinearOut["(B, K)"]:::tensor
-        
-        AddBias["Add Bias (+ b)"]:::output
-        Logits[("Final Logits<br>(B, K)")]:::output
-
         GenW --> DotProd
-        InputRef --> DotProd --> Weighted --> Sum --> LinearOut
-        LinearOut --> AddBias
+        InputRef --> DotProd --> Sum --> AddBias
         GenB --> AddBias --> Logits
     end
+
+    %% Subgraph background colors
+    style Encoder fill:#E3F2FD,stroke:#1565C0,stroke-width:2px
+    style Transition fill:#F3E5F5,stroke:#7B1FA2,stroke-width:2px
+    style BiasGen fill:#E0F7FA,stroke:#00838F,stroke-width:2px
+    style Application fill:#FFEBEE,stroke:#C62828,stroke-width:2px
+
+    %% Colorful thick arrows (by flow path)
+    linkStyle 0 stroke:#1565C0,stroke-width:4px
+    linkStyle 1,2,3,4,5,6 stroke:#7B1FA2,stroke-width:4px
+    linkStyle 7,8,9,10 stroke:#6A1B9A,stroke-width:4px
+    linkStyle 11,12,13 stroke:#00838F,stroke-width:4px
+    linkStyle 14 stroke:#80DEEA,stroke-width:4px
+    linkStyle 15 stroke:#E65100,stroke-width:4px
+    linkStyle 16,17,18,19,20 stroke:#C62828,stroke-width:4px
+```
