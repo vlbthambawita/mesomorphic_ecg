@@ -4,12 +4,6 @@
   <img src="https://img.shields.io/badge/Platform-Linux%20%7C%20macOS-lightgrey.svg" />
 </p>
 
-# ECG-IMN: Interpretable Mesomorphic Neural Networks for 12-Lead Electrocardiogram Interpretation
-
-## Abstract
-
-Deep learning has achieved expert-level performance in automated electrocardiogram (ECG) diagnosis, yet the "black-box" nature of these models hinders their clinical deployment. Trust in medical AI requires not just high accuracy but also transparency regarding the specific physiological features driving predictions. Existing explainability methods for ECGs typically rely on post-hoc approximations (e.g., Grad-CAM and SHAP), which can be unstable, computationally expensive, and unfaithful to the model's actual decision-making process. **In this work, we propose the ECG-IMN, an Interpretable Mesomorphic Neural Network tailored for high-resolution 12-lead ECG classification.** Unlike standard classifiers, the ECG-IMN functions as a hypernetwork: a deep convolutional backbone generates the parameters of a strictly linear model specific to each input sample. This architecture enforces intrinsic interpretability, as the decision logic is mathematically transparent and the generated weights $\mathbf{W}$ serve as exact, high-resolution feature attribution maps. We introduce a transition decoder that effectively maps latent features to sample-wise weights, enabling precise localization of pathological evidence (e.g., ST-elevation, T-wave inversion) in both time and lead dimensions. **We evaluate our approach on the PTB-XL dataset for Myocardial Infarction detection**, demonstrating that the ECG-IMN achieves competitive predictive performance (AUROC comparable to black-box baselines) while providing faithful, instance-specific explanations. By explicitly decoupling parameter generation from prediction execution, our framework bridges the gap between deep learning capability and clinical trustworthiness, offering a principled path toward "white-box" cardiac diagnostics.
-
 ## Quickstart: PTB-XL NORM vs X (Train / Inference / Plots)
 
 This project provides **Interpretable Mesomorphic Networks (IMN)** and a **2D CNN + Grad-CAM baseline** for binary ECG classification (NORM vs MI, STTC, CD, HYP) on PTB-XL. All scripts run from the project root.
@@ -107,9 +101,14 @@ flowchart TB
 
 [![Hugging Face](https://huggingface.co/front/assets/huggingface_logo-noborder.svg)](https://huggingface.co/SEARCH-IHI/mesomorphicECG) [**Model on Hugging Face**](https://huggingface.co/SEARCH-IHI/mesomorphicECG)
 
-[![Space - MesomorphicECG XAI](https://img.shields.io/badge/Space-MesomorphicECG__XAI-yellow)](https://huggingface.co/spaces/SEARCH-IHI/mesomorphicECG_XAI)
+### 🎯 Try the Interactive XAI Demo
 
-An interactive XAI demo is available as a Hugging Face Space: [**MesomorphicECG XAI**](https://huggingface.co/spaces/SEARCH-IHI/mesomorphicECG_XAI).
+> [!TIP]
+> **Space — MesomorphicECG XAI**
+>
+> An interactive XAI demo is available as a Hugging Face Space: [**MesomorphicECG XAI**](https://huggingface.co/spaces/SEARCH-IHI/mesomorphicECG_XAI)
+>
+> [![🚀 Open Demo](https://img.shields.io/badge/🚀_Open_Demo-MesomorphicECG_XAI-ff6b35?style=for-the-badge&logo=huggingface)](https://huggingface.co/spaces/SEARCH-IHI/mesomorphicECG_XAI)
 
 Pre-trained IMN checkpoints are available on [Hugging Face](https://huggingface.co/SEARCH-IHI/mesomorphicECG). Download a checkpoint and pass it to the inference scripts via `--ckpt`, or place it in the expected run directory so the inference scripts auto-detect it.
 
